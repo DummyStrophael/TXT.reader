@@ -1,0 +1,33 @@
+﻿
+==============================================================================
+  文件：运行自检.bat
+==============================================================================
+@echo off
+rem  Self-test launcher (keeps the console open so you can read the result).
+setlocal
+cd /d "%~dp0"
+rem Force a UTF-8 console so the Chinese self-test output renders correctly.
+chcp 65001 >nul 2>nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+
+set "PYEXE="
+where py >nul 2>nul && set "PYEXE=py -3"
+if not defined PYEXE (
+  where python >nul 2>nul && set "PYEXE=python"
+)
+if not defined PYEXE (
+  echo.
+  echo [ERROR] Python not found on PATH. Install Python 3.8+ first.
+  echo.
+  pause
+  exit /b 1
+)
+
+%PYEXE% "%~dp0run.py" --selftest %*
+echo.
+echo ---------------------------------------------------------------
+echo Exit code: %ERRORLEVEL%
+pause
+endlocal
+

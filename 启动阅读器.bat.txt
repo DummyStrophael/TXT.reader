@@ -1,0 +1,46 @@
+﻿
+==============================================================================
+  文件：启动阅读器.bat
+==============================================================================
+@echo off
+rem ---------------------------------------------------------------
+rem  Text Reader launcher. ASCII only on purpose: cmd.exe parses
+rem  .bat files with the OEM code page, so non-ASCII text here would
+rem  show up as garbage. All Chinese messages live in run.py.
+rem ---------------------------------------------------------------
+setlocal
+cd /d "%~dp0"
+rem Force a UTF-8 console so any Python message shows correctly.
+chcp 65001 >nul 2>nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+
+set "PYEXE="
+where py >nul 2>nul && set "PYEXE=py -3"
+if not defined PYEXE (
+  where python >nul 2>nul && set "PYEXE=python"
+)
+if not defined PYEXE (
+  echo.
+  echo [ERROR] Python not found on PATH.
+  echo Install Python 3.8+ from https://www.python.org/downloads/
+  echo and make sure "Add python.exe to PATH" is checked.
+  echo.
+  pause
+  exit /b 1
+)
+
+rem Prefer pythonw.exe so no console window stays open behind the reader.
+set "PYW="
+for /f "delims=" %%i in ('%PYEXE% -c "import os,sys;print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))" 2^>nul') do set "PYW=%%i"
+
+if exist "%PYW%" (
+  start "" "%PYW%" "%~dp0run.py" %*
+  exit /b 0
+)
+
+rem Fallback: run with a console so any traceback stays visible.
+%PYEXE% "%~dp0run.py" %*
+if errorlevel 1 pause
+endlocal
+

@@ -1,0 +1,4787 @@
+﻿文本阅读器 · 完整源码（Python + tkinter，零第三方依赖）
+生成时间：2026-10-07 15:25
+数据默认存放在「程序目录\data\」（便携模式，见 使用说明与技术栈.txt）
+文件清单：
+   1. pyreader/__init__.py
+   2. pyreader/__main__.py
+   3. pyreader/dpi.py
+   4. pyreader/textproc.py
+   5. pyreader/theme.py
+   6. pyreader/storage.py
+   7. pyreader/state.py
+   8. pyreader/wallpaper.py
+   9. pyreader/app.py
+  10. pyreader/selftest.py
+  11. run.py
+  12. pyreader_exe.py
+  13. 启动阅读器.bat
+  14. 运行自检.bat
+==============================================================================
+
+==============================================================================
+  文件：pyreader/__init__.py
+==============================================================================
+"""文本阅读器 · Python 桌面版。
+
+分层：
+    textproc  纯文本处理（编码探测 / 分段 / 章节识别）—— 无 UI、可单测
+    theme     配色与主题令牌（含护眼调色板变换）
+    storage   SQLite 书库 + JSON 设置
+    state     发布-订阅状态容器
+    app       tkinter 主窗口（布局 / 渲染 / 交互）
+"""
+
+__version__ = "1.1.0"
+__all__ = ["app", "dpi", "state", "storage", "textproc", "theme", "wallpaper", "selftest"]
+
+
+==============================================================================
+  文件：pyreader/__main__.py
+==============================================================================
+"""命令行入口：python -m pyreader"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import tkinter as tk
+from pathlib import Path
+from typing import List, Optional
+
+from . import dpi as dpi_mod
+from . import selftest as selftest_mod
+from .app import ReaderApp
+from .storage import Library, Settings, default_data_dir, migrate_legacy_data
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="pyreader", description="文本阅读器（Python + tkinter）")
+    parser.add_argument("files", nargs="*", help="启动后直接导入这些文本文件")
+    parser.add_argument("--data-dir", help="数据目录（默认：程序目录\\data，便携模式）")
+    parser.add_argument("--selftest", action="store_true", help="运行自检后退出（不进入主循环）")
+    parser.add_argument("--no-ui-selftest", action="store_true", help="自检时跳过 GUI 用例")
+    parser.add_argument("--dpi", choices=("auto", "off"), default="auto",
+                        help="是否声明 DPI 感知以获得清晰字体（off 可强制关闭，默认 auto）")
+    args = parser.parse_args(argv)
+
+    # 必须在创建任何窗口之前声明 DPI 感知，否则 150% 缩放下字会被系统拉伸变糊
+    if args.dpi == "auto":
+        dpi_mod.enable()
+
+    data_dir = Path(args.data_dir).expanduser() if args.data_dir else default_data_dir()
+
+    if args.selftest:
+        # 自检会在数据目录里建测试书籍：没有显式指定 --data-dir 时一律用临时目录，
+        # 绝不污染用户真实书架。
+        test_dir = Path(args.data_dir).expanduser() if args.data_dir else None
+        return selftest_mod.run(data_dir=test_dir, ui=not args.no_ui_selftest)
+
+    # 老版本数据在 %APPDATA%：第一次以便携模式运行时复制过来，老目录保留
+    migrated = migrate_legacy_data(data_dir)
+
+    root = tk.Tk()
+    library = Library(data_dir / "library.db")
+    settings = Settings(data_dir / "settings.json")
+    app = ReaderApp(root, library, settings, str(data_dir))
+    if migrated:
+        app.status(f"已把原书架迁移到：{data_dir}")
+    if args.files:
+        root.after(120, lambda: app.import_paths(list(args.files)))
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+==============================================================================
+  文件：pyreader/dpi.py
+==============================================================================
+"""高 DPI（清晰度）支持。
+
+问题：Windows 在 150% 缩放时，如果进程没有声明 DPI 感知，系统会把窗口先按
+96 DPI 渲染成位图、再整体放大 1.5 倍 —— 于是字全是糊的。
+
+修法：在**创建任何窗口之前**声明 DPI 感知（PerMonitorV2 → PerMonitor → System 逐级降级），
+此后 Tk 直接按真实 DPI（如 144）渲染，字体原生清晰；界面里所有像素常量再用
+ReaderApp.S() 乘上 DPI 比例，保证窗口与控件的物理尺寸不变。
+
+命令行自检：
+    python -m pyreader.dpi
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import Optional
+
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+
+_enabled: Optional[str] = None
+
+
+def enable() -> str:
+    """声明 DPI 感知，返回使用的方式（重复调用返回首次结果）。
+
+    必须在 tkinter.Tk() 之前调用；一旦进程里已经创建过窗口，Windows 会拒绝修改。
+    """
+    global _enabled
+    if _enabled is not None:
+        return _enabled
+    if sys.platform != "win32":
+        _enabled = "non-win32（由系统/桌面环境处理）"
+        return _enabled
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    try:  # Windows 10 1703+：每显示器感知 v2
+        if user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)):
+            _enabled = "PerMonitorV2"
+            return _enabled
+    except Exception:
+        pass
+    try:  # Windows 8.1+：每显示器感知
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            _enabled = "PerMonitor"
+            return _enabled
+    except Exception:
+        pass
+    try:  # Vista+：系统级感知
+        if user32.SetProcessDPIAware():
+            _enabled = "System"
+            return _enabled
+    except Exception:
+        pass
+    _enabled = "未启用（系统将缩放位图，界面可能偏糊）"
+    return _enabled
+
+
+def main() -> int:
+    """打印当前显示环境，便于确认清晰度是否生效。"""
+    import tkinter as tk
+    import tkinter.font as tkfont
+
+    how = enable()
+    root = tk.Tk()
+    root.withdraw()
+    dpi = root.winfo_fpixels("1i")
+    scaling = float(root.tk.call("tk", "scaling"))
+    font = tkfont.Font(root=root, family="Microsoft YaHei UI", size=19)
+    print(f"DPI 感知方式 : {how}")
+    print(f"系统 DPI     : {dpi:.0f}（96 = 100%，144 = 150%）")
+    print(f"Tk 缩放      : {scaling:.3f}")
+    print(f"19pt 行高    : {font.metrics('linespace')} px（原生像素，无系统拉伸）")
+    print(f"屏幕逻辑尺寸 : {root.winfo_screenwidth()}x{root.winfo_screenheight()}")
+    root.destroy()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+==============================================================================
+  文件：pyreader/textproc.py
+==============================================================================
+"""纯文本处理层：编码探测、分段、章节识别、阅读统计。
+
+这一层完全不依赖 tkinter，也不读写任何文件，因此可以单独导入和单元测试。
+输入永远是「一段文本」，输出永远是「一组排版块 + 章节表」。
+"""
+
+from __future__ import annotations
+
+import codecs
+import re
+from dataclasses import dataclass, field
+from typing import Iterable, List
+
+# --------------------------------------------------------------------------
+# 数据结构
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Block:
+    """一个排版块。kind 决定它在阅读区里用哪个 Text tag 渲染。"""
+
+    kind: str  # 'h1' 文首大标题 | 'meta' 元信息行 | 'h2' 章节标题 | 'p' 正文段落
+    text: str
+
+
+@dataclass(frozen=True)
+class Chapter:
+    """一条目录项。block_index 指回 Article.blocks 里的下标。"""
+
+    title: str
+    block_index: int
+
+
+@dataclass
+class Article:
+    """一本书渲染所需的全部内容（不含业务状态）。"""
+
+    blocks: List[Block] = field(default_factory=list)
+    chapters: List[Chapter] = field(default_factory=list)
+    chars: int = 0
+    minutes: int = 0
+
+    @property
+    def paragraphs(self) -> int:
+        return sum(1 for b in self.blocks if b.kind == "p")
+
+
+# --------------------------------------------------------------------------
+# 编码探测
+# --------------------------------------------------------------------------
+
+# 中文环境最常见的两种非 UTF-8 编码：GB18030（GBK/GB2312 的超集）与 UTF-16。
+_CANDIDATES = ("utf-8", "gb18030")
+
+
+def _sniff_utf16(data: bytes) -> str:
+    """无 BOM 的 UTF-16 猜测。
+
+    UTF-16 文本里大量字符的高字节是 0x00（ASCII 区间尤其明显），据此看
+    「奇数位还是偶数位更容易出 0x00」就能判断字节序；判不出来就返回空串。
+    中文 UTF-16 的 0x00 很少，这里不强行猜测，避免把正常文本猜坏。
+    """
+    if len(data) < 8:
+        return ""
+    even = data[0::2]
+    odd = data[1::2]
+    n_even = even.count(0)
+    n_odd = odd.count(0)
+    ratio_odd = n_odd / max(1, len(odd))
+    ratio_even = n_even / max(1, len(even))
+    if ratio_odd > 0.30 and n_odd > n_even * 3:
+        return "utf-16-le"
+    if ratio_even > 0.30 and n_even > n_odd * 3:
+        return "utf-16-be"
+    return ""
+
+
+def decode_bytes(data: bytes) -> "tuple[str, str]":
+    """把文件字节解码成文本，返回 (文本, 编码名)。
+
+    顺序：BOM → 无 BOM 的 UTF-16 猜测 → 严格 UTF-8 → GB18030 → 有损 UTF-8 兜底。
+    「严格」是关键：宁可解码失败也不要静默产生乱码。
+    """
+    if data.startswith(codecs.BOM_UTF8):
+        return data[len(codecs.BOM_UTF8):].decode("utf-8"), "UTF-8"
+    if data.startswith(codecs.BOM_UTF16_LE):
+        return data[len(codecs.BOM_UTF16_LE):].decode("utf-16-le"), "UTF-16LE"
+    if data.startswith(codecs.BOM_UTF16_BE):
+        return data[len(codecs.BOM_UTF16_BE):].decode("utf-16-be"), "UTF-16BE"
+
+    sniffed = _sniff_utf16(data)
+    if sniffed:
+        try:
+            return data.decode(sniffed), "UTF-16LE" if sniffed.endswith("le") else "UTF-16BE"
+        except UnicodeDecodeError:
+            pass
+
+    for enc in _CANDIDATES:
+        try:
+            return data.decode(enc), enc.upper() if enc == "gb18030" else "UTF-8"
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace"), "UTF-8（有损）"
+
+
+def guess_title(filename: str, content: str) -> str:
+    """书名：优先文件名（去掉扩展名），其次正文第一行短句。"""
+    stem = ""
+    if filename:
+        base = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        stem = base.rsplit(".", 1)[0].strip() if "." in base else base.strip()
+    if stem:
+        return stem[:60]
+    for line in content.splitlines():
+        line = line.strip()
+        if line and len(line) <= 40:
+            return line[:60]
+    return "未命名文本"
+
+
+# --------------------------------------------------------------------------
+# 分段
+# --------------------------------------------------------------------------
+
+_CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]")
+
+
+def split_paragraphs(text: str) -> List[str]:
+    """把整本书切成段落。
+
+    两种版式自适应：
+    * 空行占比 >= 5%：按空行分段（Markdown、西文散文），行内换行视为软换行并拼接；
+    * 否则一行一段（多数中文 txt 的硬折行）。
+    标题行永远独占一段，绝不被拼进正文。
+    """
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blanks = sum(1 for l in lines if not l.strip())
+    spaced = blanks / max(1, len(lines)) >= 0.05
+
+    out: List[str] = []
+    buf: List[str] = []
+
+    def flush() -> None:
+        if not buf:
+            return
+        s = ""
+        for line in buf:
+            if not s:
+                s = line
+                continue
+            # 中文硬折行直接拼接；西文用空格连接
+            s += line if (_CJK.search(s[-1]) and _CJK.match(line[0])) else " " + line
+        if s.strip():
+            out.append(s.strip())
+        buf.clear()
+
+    for raw in lines:
+        line = raw.rstrip()
+        if not line.strip():
+            if spaced:
+                flush()
+            continue
+        if is_heading(line):
+            flush()
+            out.append(line.strip())
+            continue
+        buf.append(line)
+        if not spaced:
+            flush()
+    flush()
+    return out
+
+
+# --------------------------------------------------------------------------
+# 章节识别
+# --------------------------------------------------------------------------
+# 原则：宁可少认，不可把正文当标题。
+#   * 命中：第一章 / 第一章 起点 / 第 2 章：缘起 / Chapter 3 - The Fall /
+#           序章 / 前言 / 尾声 / 番外 / Markdown 的 # 标题
+#   * 排除：含「。」的句子、以逗号分号结尾的行、超长行、
+#           以及「第一章的内容主要讲述了…」这类虚词开头的正文。
+CH_NUM = r"[0-9零一二三四五六七八九十百千两]{1,6}"
+CH_HEAD = rf"(?:第\s*{CH_NUM}\s*[章节回卷篇部幕]|Chapter\s+[0-9IVXLC]+)"
+CH_KW = r"(?:序章|序言|自序|前言|引子|楔子|尾声|终章|后记|番外|附录)"
+CH_TAIL = r"(?:|[\s:：、.．·\-—－][^\s].{0,19}|[^\s的了是在有为与和及所将把就都很].{0,5})"
+CHAPTER_RE = re.compile(rf"^(?:#{{1,3}}\s+\S.{{0,44}}|{CH_HEAD}{CH_TAIL}|{CH_KW}{CH_TAIL})$", re.I)
+
+_SENTENCE_TAIL = re.compile(r"[，；,;]$")
+
+
+def is_heading(line: str) -> bool:
+    s = line.strip()
+    if not s or len(s) > 46:
+        return False
+    if not CHAPTER_RE.match(s):
+        return False
+    if s.startswith("#") and re.match(r"^#{1,3}\s", s):
+        return True  # Markdown 标题是显式的
+    return "。" not in s and not _SENTENCE_TAIL.search(s)
+
+
+def clean_heading(line: str) -> str:
+    return re.sub(r"^#{1,6}\s*", "", line.strip()).strip()
+
+
+# --------------------------------------------------------------------------
+# 组装
+# --------------------------------------------------------------------------
+
+
+def reading_minutes(chars: int) -> int:
+    """中文按 ~420 字/分钟估算。"""
+    return max(1, round(chars / 420))
+
+
+def build_article(title: str, content: str, size: int = 0, encoding: str = "UTF-8") -> Article:
+    """把原始文本编译成排版块序列 + 章节表。"""
+    chars = len(content)
+    art = Article(chars=chars, minutes=reading_minutes(chars))
+    art.blocks.append(Block("h1", title))
+    meta = f"{chars:,} 字 · 约 {art.minutes} 分钟 · {encoding} · {human_size(size or len(content.encode('utf-8')))}"
+    art.blocks.append(Block("meta", meta))
+    art.chapters.append(Chapter("开头", 0))  # 目录第一项指向文首
+
+    for para in split_paragraphs(content):
+        idx = len(art.blocks)
+        if is_heading(para):
+            art.blocks.append(Block("h2", clean_heading(para)))
+            art.chapters.append(Chapter(clean_heading(para), idx))
+        else:
+            art.blocks.append(Block("p", para))
+    return art
+
+
+def human_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1048576:.2f} MB"
+
+
+def iter_plain_text(article: Article) -> Iterable[str]:
+    """导出纯文本（供「另存为」等扩展使用）。"""
+    for block in article.blocks:
+        if block.kind in ("h1", "h2", "meta"):
+            yield block.text
+        else:
+            yield block.text
+
+
+==============================================================================
+  文件：pyreader/theme.py
+==============================================================================
+"""配色与主题令牌。
+
+思路与 Web 版一致：主题不是一个布尔开关，而是由「背景色 + 文字色」两个输入
+推导出整套 UI 令牌（外壳、分隔线、次要文字、悬停色、强调色）。这样自定义配色
+时，书架 / 工具栏 / 目录等外壳部分依然协调，不会出现「正文是深色、外壳还是浅灰」。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+RGB = Tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class Palette:
+    bg: str  # 正文背景
+    fg: str  # 正文文字
+    chrome: str  # 外壳（工具栏 / 书架 / 侧栏）背景
+    line: str  # 分隔线
+    soft: str  # 次要文字
+    hover: str  # 悬停 / 激活背景
+    accent: str  # 强调色（按钮、进度、选中）
+    on_accent: str  # 强调色上的文字色
+    dark: bool
+
+    def as_dict(self) -> Dict[str, str]:
+        return {
+            "bg": self.bg, "fg": self.fg, "chrome": self.chrome, "line": self.line,
+            "soft": self.soft, "hover": self.hover, "accent": self.accent,
+            "on_accent": self.on_accent,
+        }
+
+
+# 6 套预设，和 Web 版一一对应
+THEMES: Dict[str, Dict[str, str]] = {
+    "paper": {"name": "纸白", "bg": "#faf8f5", "fg": "#2b2b2b", "accent": "#8a6a3b"},
+    "sepia": {"name": "米黄", "bg": "#f5ecd9", "fg": "#4a3b28", "accent": "#96702f"},
+    "green": {"name": "护眼绿", "bg": "#e4eee0", "fg": "#2f3a2c", "accent": "#4b7a3f"},
+    "gray": {"name": "淡灰", "bg": "#ecf0f2", "fg": "#2c3238", "accent": "#3d6b8e"},
+    "night": {"name": "夜间", "bg": "#1c1f24", "fg": "#c9ced7", "accent": "#7aa2f7"},
+    "ink": {"name": "纯黑", "bg": "#000000", "fg": "#b9bec7", "accent": "#8ab4f8"},
+}
+
+
+# --------------------------------------------------------------------------
+# 颜色运算（全部基于 sRGB 的简单线性混合，够用且无依赖）
+# --------------------------------------------------------------------------
+
+
+def hex_to_rgb(value: str) -> RGB:
+    s = str(value).lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    s = (s + "000000")[:6]
+    return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+
+
+def rgb_to_hex(rgb: RGB) -> str:
+    return "#" + "".join(f"{max(0, min(255, int(round(v)))):02x}" for v in rgb)
+
+
+def luminance(color: str) -> float:
+    r, g, b = (v / 255 for v in hex_to_rgb(color))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def mix(a: str, b: str, t: float) -> str:
+    """把 a 向 b 混合 t（0~1）。"""
+    ca, cb = hex_to_rgb(a), hex_to_rgb(b)
+    return rgb_to_hex(tuple(ca[i] + (cb[i] - ca[i]) * t for i in range(3)))  # type: ignore[arg-type]
+
+
+def shade(color: str, amount: float) -> str:
+    """amount > 0 提亮（向白），< 0 压暗（向黑）。"""
+    return mix(color, "#ffffff" if amount > 0 else "#000000", abs(amount))
+
+
+def contrast_text(color: str) -> str:
+    """在给定底色上选择可读的文字色。"""
+    return "#1a1a1a" if luminance(color) > 0.55 else "#ffffff"
+
+
+def hsv_to_hex(hue: float, sat: float, val: float) -> str:
+    """HSV(0~360, 0~1, 0~1) → '#rrggbb'。用于给每本书生成稳定的书脊颜色。"""
+    import colorsys
+
+    r, g, b = colorsys.hsv_to_rgb((float(hue) % 360.0) / 360.0,
+                                  max(0.0, min(1.0, float(sat))),
+                                  max(0.0, min(1.0, float(val))))
+    return rgb_to_hex((r * 255.0, g * 255.0, b * 255.0))
+
+
+def derive_palette(bg: str, fg: str, accent: str = "", dark: Optional[bool] = None) -> Palette:
+    if dark is None:
+        dark = luminance(bg) < 0.42
+    acc = accent or mix(fg, "#7aa2f7" if dark else "#b07d3c", 0.55)
+    return Palette(
+        bg=bg,
+        fg=fg,
+        chrome=shade(bg, 0.05 if dark else -0.035),
+        line=shade(bg, 0.13 if dark else -0.11),
+        soft=mix(fg, bg, 0.42),
+        hover=shade(bg, 0.09 if dark else -0.06),
+        accent=acc,
+        on_accent=contrast_text(acc),
+        dark=dark,
+    )
+
+
+def palette_for(settings: Dict) -> Palette:
+    """根据设置得到基础调色板（不含护眼叠加）。"""
+    key = settings.get("theme", "paper")
+    if key == "custom":
+        return derive_palette(settings.get("custom_bg", "#faf8f5"), settings.get("custom_fg", "#2b2b2b"))
+    t = THEMES.get(key, THEMES["paper"])
+    return derive_palette(t["bg"], t["fg"], t["accent"])
+
+
+def eye_care_palette(base: Palette) -> Palette:
+    """护眼模式：在任意主题之上做暖色降蓝光 + 降低对比度。
+
+    tkinter 没有全局滤镜，所以这里等价地做两件事：
+      1) 背景向暖色（浅色主题偏米黄、深色主题偏暖棕）偏移；
+      2) 文字向背景靠拢一点，降低反差，长时间阅读更柔和。
+    因为是对调色板做变换，所以它能和 6 套预设以及自定义配色自由叠加。
+    """
+    if base.dark:
+        bg = mix(base.bg, "#3a2c1c", 0.45)
+        fg = mix(base.fg, bg, 0.12)
+    else:
+        bg = mix(base.bg, "#ffe6bd", 0.22)
+        fg = mix(base.fg, bg, 0.14)
+    acc = mix(base.accent, "#b8862f" if not base.dark else "#d9a441", 0.35)
+    return Palette(
+        bg=bg, fg=fg,
+        chrome=mix(base.chrome, bg, 0.55),
+        line=mix(base.line, bg, 0.35),
+        soft=mix(base.soft, bg, 0.25),
+        hover=mix(base.hover, bg, 0.35),
+        accent=acc,
+        on_accent=contrast_text(acc),
+        dark=base.dark,
+    )
+
+
+def effective_palette(settings: Dict) -> Palette:
+    base = palette_for(settings)
+    return eye_care_palette(base) if settings.get("eye_care") else base
+
+
+==============================================================================
+  文件：pyreader/storage.py
+==============================================================================
+"""持久化层：SQLite 书库 + JSON 设置。
+
+对应 Web 版的 IndexedDB + localStorage：
+  * 书库用 SQLite（标准库 sqlite3，WAL 模式），正文直接存库，
+    元数据与正文分表查询——书架只读元数据，正文按需读取；
+  * 设置用 JSON 小文件，原子写入（临时文件 + replace），避免半截文件。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+APP_DIR_NAME = "PyTextReader"
+
+
+# --------------------------------------------------------------------------
+# 数据模型
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BookMeta:
+    """书架元数据：不含正文，用于列表渲染。"""
+
+    id: str
+    title: str
+    size: int
+    encoding: str
+    added_at: float
+    last_read_at: float
+    progress: float
+    progress_updated_at: float
+    char_offset: int = 0        # 首行可见字符在全书中的下标（排版无关的精确位置）
+
+    @property
+    def percent(self) -> int:
+        return int(round(self.progress * 100))
+
+    @property
+    def finished(self) -> bool:
+        return self.progress >= 0.999
+
+    @property
+    def percent_text(self) -> str:
+        if self.finished:
+            return "已读完"
+        return f"{self.percent}%" if self.percent > 0 else "未开始"
+
+
+@dataclass(frozen=True)
+class Book:
+    meta: BookMeta
+    content: str
+
+
+def _row_to_meta(row: sqlite3.Row) -> BookMeta:
+    keys = row.keys()
+    return BookMeta(
+        id=row["id"], title=row["title"], size=row["size"], encoding=row["encoding"],
+        added_at=row["added_at"], last_read_at=row["last_read_at"],
+        progress=row["progress"], progress_updated_at=row["progress_updated_at"],
+        char_offset=int(row["char_offset"]) if "char_offset" in keys else 0,
+    )
+
+
+# --------------------------------------------------------------------------
+# 路径
+# --------------------------------------------------------------------------
+
+
+def portable_dir() -> Path:
+    """程序自身所在目录：打包后是 exe 所在目录，源码运行时是项目根目录。"""
+    if getattr(sys, "frozen", False):          # PyInstaller 打包后
+        return Path(sys.executable).resolve().parent
+    here = Path(__file__).resolve()
+    # 源码布局是 <项目>/pyreader/storage.py
+    return here.parent.parent if here.parent.name == "pyreader" else here.parent
+
+
+def _user_data_dir() -> Path:
+    """传统用户目录（便携目录不可写时的退路，也是老数据的迁移来源）。"""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
+        return Path(base) / APP_DIR_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_DIR_NAME
+    base = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
+    return Path(base) / APP_DIR_NAME
+
+
+def _writable(path: Path) -> bool:
+    """能不能在这个目录里建文件（Program Files、只读盘、无权限共享盘会失败）。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def default_data_dir() -> Path:
+    """数据目录：默认放「程序目录\\data」（便携，跟着文件夹一起搬）。
+
+    优先级：--data-dir > 环境变量 PYREADER_HOME > 程序目录\\data > 用户目录。
+    程序目录不可写时自动回退到用户目录，不影响使用。
+    """
+    override = os.environ.get("PYREADER_HOME")
+    if override:
+        return Path(override).expanduser()
+    portable = portable_dir() / "data"
+    if _writable(portable):
+        return portable
+    return _user_data_dir()
+
+
+def migrate_legacy_data(new_dir: Path) -> bool:
+    """把老位置（%APPDATA%\\PyTextReader）的数据搬到便携目录，只在新目录还空着时做一次。
+
+    是「复制」而不是「移动」：老目录原样保留，出问题还能找回来。
+    """
+    try:
+        if new_dir.resolve() == _user_data_dir().resolve():
+            return False
+        if (new_dir / "library.db").exists():
+            return False
+        legacy = _user_data_dir()
+        if not (legacy / "library.db").exists():
+            return False
+        new_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("library.db", "library.db-wal", "library.db-shm", "settings.json"):
+            src = legacy / name
+            if src.exists():
+                shutil.copy2(src, new_dir / name)
+        return True
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------------------
+# 书库
+# --------------------------------------------------------------------------
+
+
+class Library:
+    """SQLite 书库。所有写操作立即提交，避免异常退出丢数据。"""
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS books (
+        id                   TEXT PRIMARY KEY,
+        title                TEXT NOT NULL,
+        content              TEXT NOT NULL,
+        size                 INTEGER NOT NULL DEFAULT 0,
+        encoding             TEXT NOT NULL DEFAULT 'UTF-8',
+        added_at             REAL NOT NULL,
+        last_read_at         REAL NOT NULL,
+        progress             REAL NOT NULL DEFAULT 0,
+        progress_updated_at  REAL NOT NULL DEFAULT 0,
+        char_offset          INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_books_last_read ON books(last_read_at DESC);
+    """
+
+    def __init__(self, db_path: Path):
+        self.path = Path(db_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.path))
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.executescript(self.SCHEMA)
+        self._migrate()
+        self.conn.commit()
+
+    def _migrate(self) -> None:
+        """老库补列：char_offset 是后来加的精确阅读位置。"""
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(books)")}
+        if "char_offset" not in cols:
+            self.conn.execute("ALTER TABLE books ADD COLUMN char_offset INTEGER NOT NULL DEFAULT 0")
+
+    # -- 读 -----------------------------------------------------------------
+
+    def all_meta(self) -> List[BookMeta]:
+        rows = self.conn.execute(
+            "SELECT * FROM books ORDER BY last_read_at DESC, added_at DESC"
+        ).fetchall()
+        return [_row_to_meta(r) for r in rows]
+
+    def get(self, book_id: str) -> Optional[Book]:
+        row = self.conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+        if row is None:
+            return None
+        return Book(meta=_row_to_meta(row), content=row["content"])
+
+    def get_meta(self, book_id: str) -> Optional[BookMeta]:
+        book = self.get(book_id)
+        return book.meta if book else None
+
+    def count(self) -> int:
+        return int(self.conn.execute("SELECT COUNT(*) AS n FROM books").fetchone()["n"])
+
+    def get_by_title(self, title: str) -> List[BookMeta]:
+        rows = self.conn.execute(
+            "SELECT * FROM books WHERE title = ? ORDER BY added_at DESC", (title,)
+        ).fetchall()
+        return [_row_to_meta(r) for r in rows]
+
+    # -- 写 -----------------------------------------------------------------
+
+    def add(self, title: str, content: str, encoding: str = "UTF-8", size: Optional[int] = None) -> BookMeta:
+        now = time.time()
+        meta = BookMeta(
+            id=uuid.uuid4().hex[:12], title=title or "未命名文本",
+            size=size if size is not None else len(content.encode("utf-8")),
+            encoding=encoding, added_at=now, last_read_at=now,
+            progress=0.0, progress_updated_at=0.0,
+        )
+        self.conn.execute(
+            "INSERT INTO books (id, title, content, size, encoding, added_at, last_read_at, progress, progress_updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (meta.id, meta.title, content, meta.size, meta.encoding,
+             meta.added_at, meta.last_read_at, meta.progress, meta.progress_updated_at),
+        )
+        self.conn.commit()
+        return meta
+
+    def remove(self, book_id: str) -> None:
+        self.conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
+        self.conn.commit()
+
+    def set_progress(self, book_id: str, ratio: float, char_offset: int = 0) -> None:
+        """ratio 是 0~1 的已读比例（视口底部字符 / 总字符），char_offset 是精确的字符下标。"""
+        self.conn.execute(
+            "UPDATE books SET progress = ?, char_offset = ?, progress_updated_at = ? WHERE id = ?",
+            (max(0.0, min(1.0, float(ratio))), max(0, int(char_offset)), time.time(), book_id),
+        )
+        self.conn.commit()
+
+    def touch(self, book_id: str) -> None:
+        self.conn.execute("UPDATE books SET last_read_at = ? WHERE id = ?", (time.time(), book_id))
+        self.conn.commit()
+
+    def rename(self, book_id: str, title: str) -> None:
+        self.conn.execute("UPDATE books SET title = ? WHERE id = ?", (title, book_id))
+        self.conn.commit()
+
+    def close(self) -> None:
+        try:
+            self.conn.commit()
+        finally:
+            self.conn.close()
+
+
+# --------------------------------------------------------------------------
+# 设置
+# --------------------------------------------------------------------------
+
+DEFAULT_SETTINGS: Dict = {
+    "font_size": 19,
+    "line_height": 1.9,
+    "page_width": 720,
+    "font_family": "serif",      # serif | sans
+    "theme": "paper",            # paper | sepia | green | gray | night | ink | custom
+    "custom_bg": "#faf8f5",
+    "custom_fg": "#2b2b2b",
+    "eye_care": False,
+    "indent": True,
+    "shelf_open": True,
+    "sidebar": None,             # None | 'toc' | 'settings'
+    "window": "",                # 记住窗口尺寸 "960x680+80+60"（逻辑像素）
+    # --- 壁纸与质感 ---------------------------------------------------
+    "wallpaper_on": False,
+    "wallpaper_path": "",
+    "wallpaper_mode": "cover",   # cover | contain | tile | stretch
+    "wallpaper_dim": 0.28,       # 壁纸向主题底色融合/压暗的比例
+    "wallpaper_panel": 0.18,     # 外壳（工具栏/书架/侧栏）向壁纸靠拢的比例
+    "texture_on": True,          # 程序化纸纹
+    "texture_strength": 10,      # 纸纹透明度 0~40
+    "immersive": False,          # 沉浸模式（隐藏书架与侧栏）
+}
+
+
+class Settings:
+    """JSON 设置文件。读取时与默认值合并，缺字段不会导致崩溃。"""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> Dict:
+        data: Dict = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except FileNotFoundError:
+            pass
+        except (json.JSONDecodeError, OSError):
+            pass  # 损坏就用默认值，不阻塞启动
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
+        return merged
+
+    def save(self, settings: Dict) -> None:
+        payload = {k: settings.get(k, v) for k, v in DEFAULT_SETTINGS.items()}
+        tmp = self.path.with_suffix(".json.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass  # 磁盘不可写时只影响持久化，不影响本次阅读
+
+
+==============================================================================
+  文件：pyreader/state.py
+==============================================================================
+"""极简状态容器（发布-订阅）。
+
+与 Web 版 createStore 一一对应：所有视图只读 state，所有写入都走 set()，
+订阅者按「渲染指纹」决定是否真正重绘。这样滚动、进度落盘这类高频写入
+不会重建正文控件，也就不会丢掉滚动位置和选中状态。
+"""
+
+from __future__ import annotations
+
+from typing import Callable, Dict, List, Optional
+
+Listener = Callable[[Dict, Dict], None]
+
+
+class Store:
+    def __init__(self, initial: Optional[Dict] = None):
+        self._state: Dict = dict(initial or {})
+        self._listeners: List[Listener] = []
+
+    @property
+    def state(self) -> Dict:
+        """只读视图（约定：调用方不要直接改内容）。"""
+        return self._state
+
+    def set(self, patch: Optional[Dict] = None, **kwargs) -> None:
+        prev = self._state
+        nxt = dict(prev)
+        if patch:
+            nxt.update(patch)
+        if kwargs:
+            nxt.update(kwargs)
+        if all(nxt.get(k) == prev.get(k) for k in nxt) and set(nxt) == set(prev):
+            return  # 无变化，不打扰订阅者
+        self._state = nxt
+        for fn in list(self._listeners):
+            fn(nxt, prev)
+
+    def subscribe(self, fn: Listener) -> Callable[[], None]:
+        self._listeners.append(fn)
+        return lambda: self._listeners.remove(fn) if fn in self._listeners else None
+
+
+==============================================================================
+  文件：pyreader/wallpaper.py
+==============================================================================
+"""壁纸（背景图）加载、缩放与着色。
+
+设计要点
+--------
+* **双后端**：装了 Pillow 就用 Pillow（LANCZOS 缩放、getpixel 取色）；没装 Pillow
+  就退回 Tk 自带的 ``tk.PhotoImage``（整数倍 zoom/subsample、get 取色）。
+  对外只有 ``backend()`` 一个判断点，其余 API 的**语义**在两种后端下一致
+  （取色坐标系、可见区域、四种模式的尺寸关系都相同）；只有平均色的具体数值会
+  因采样方式略有差异：Pillow 用 ``resize((1,1))`` 精确求均值，Tk 用 ≤400 点网格
+  采样估算（两者通常相差几个色阶，足够侧栏/工具栏融入背景）。
+* **dim 统一交给覆盖层**：``photo`` 始终是**未着色**的缩放图，压暗/染色由
+  ``dim_overlay()`` 返回的 4×4 半透明覆盖层负责 —— Tk 后端没有像素级混合能力，
+  只有这样两种后端的最终显示才一致，``sample()``/``region_color()`` 也不会因为
+  后端不同而返回「被压暗」或「未压暗」两种颜色。
+  若确实想让 Pillow 把颜色直接混进图里，传 ``bake_dim=True``：此时
+  ``dim_in_photo=True`` 且 ``dim_overlay()`` 返回 ``None``，避免叠加两次。
+* **PhotoImage 的 GC 陷阱**：``zoom()`` / ``subsample()`` / ``PhotoImage(data=...)``
+  返回的都是**新对象**，一旦 Python 侧没有引用，Tk 里的图片会被销毁，界面上
+  直接变成空白（实测：``del`` 之后 ``image names`` 里就没了）。本模块把主图
+  挂在 ``Wallpaper`` 实例上、覆盖层挂在实例缓存里；调用方自己创建的对象
+  （``noise_tile()``、以及 ``dim_overlay().zoom(k)`` 出来的大图）也**必须自己
+  保存引用**。
+* **photo 的类型随后端变化**：pillow 后端是 ``PIL.ImageTk.PhotoImage``（没有
+  ``zoom``/``subsample`` 方法），Tk 后端是 ``tk.PhotoImage``。两者都能直接交给
+  ``Canvas.create_image``；需要 ``zoom``/``subsample`` 的只有本模块用 Tk 编码器
+  生成的图（覆盖层、纸纹、暗角），它们在两种后端下都是 ``tk.PhotoImage``。
+* **Tk 8.6 不能裁剪**：Python 的 ``tkinter.PhotoImage.copy()`` 只接受 ``self``
+  （签名就是 ``copy(self)``，没有 ``from_coords``），所以 cover 模式不裁剪：
+  缩放结果可能大于目标，由 Canvas 居中放置自然裁掉（``place()`` 返回 ``center``）。
+* **Tk 的整数缩放是向上取整**：``subsample(k)`` 的尺寸是 ``ceil(n/k)``（实测
+  9→5 with k=2），本模块的尺寸推算按此实现，保证 cover/stretch 结果 ≥ 目标、
+  contain/tile 结果 ≤ 目标。
+
+用法::
+
+    wp = Wallpaper("bg.png", (w, h), mode="cover", dim=0.3, tint="#101418")
+    anchor, x, y = wp.place()               # 注意顺序是 (anchor, x, y)
+    canvas.create_image(x, y, anchor=anchor, image=wp.photo)     # 主图
+    ov = wp.dim_overlay()                                        # 压暗层（可能为 None）
+    if ov is not None:
+        canvas.create_image(0, 0, anchor="nw", image=ov.zoom(k))  # 调用方放大/平铺
+
+命令行自检::
+
+    python -m pyreader.wallpaper          # 打印 [PASS]/[FAIL] 与后端名
+    set PYREADER_WALLPAPER_BACKEND=tk     # 有 Pillow 时也可强制走 Tk 回退路径
+"""
+
+from __future__ import annotations
+
+import base64
+import math
+import os
+import random
+import struct
+import sys
+import tempfile
+import tkinter as tk
+import zlib
+from typing import Any, Optional, Sequence
+
+from .theme import hex_to_rgb, rgb_to_hex
+
+Mode = str  # "cover" | "contain" | "tile" | "stretch"
+
+RGB = tuple[int, int, int]
+Size = tuple[int, int]
+
+MODES: tuple[str, ...] = ("cover", "contain", "tile", "stretch")
+
+# 各后端能打开的扩展名（小写，带点）
+PILLOW_EXTENSIONS: tuple[str, ...] = (
+    ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff",
+)
+TK_EXTENSIONS: tuple[str, ...] = (".png", ".gif", ".ppm", ".pgm")
+
+# 覆盖层默认边长：很小，交给调用方 zoom/平铺（Tk 不能裁剪，小图最省内存）
+_OVERLAY_SIZE = 4
+
+
+class WallpaperError(RuntimeError):
+    """壁纸相关的错误，message 一定是中文说明，便于直接显示在界面上。"""
+
+
+# --------------------------------------------------------------------------
+# 后端探测
+# --------------------------------------------------------------------------
+
+_PIL_MODULES: Optional[tuple[Any, Any]] = None
+_PIL_TRIED = False
+_FORCED: Optional[str] = None
+_ENV_FORCED = os.environ.get("PYREADER_WALLPAPER_BACKEND", "").strip().lower()
+
+
+def _pil() -> Optional[tuple[Any, Any]]:
+    """尝试导入 Pillow，返回 ``(Image, ImageOps)``；没有则返回 None（结果缓存）。"""
+    global _PIL_MODULES, _PIL_TRIED
+    if not _PIL_TRIED:
+        _PIL_TRIED = True
+        try:
+            from PIL import Image, ImageOps  # type: ignore[import-not-found]
+        except Exception:
+            _PIL_MODULES = None
+        else:
+            _PIL_MODULES = (Image, ImageOps)
+    return _PIL_MODULES
+
+
+def force_backend(name: Optional[str]) -> None:
+    """强制指定后端（``"pillow"`` / ``"tk"`` / ``None``=自动）。
+
+    自检与排错用：在没有卸载 Pillow 的情况下也能验证 Tk 回退路径。
+    环境变量 ``PYREADER_WALLPAPER_BACKEND`` 可提供同样的初值。
+    """
+    global _FORCED
+    if name is None:
+        _FORCED = None
+        return
+    key = str(name).strip().lower()
+    if key not in ("pillow", "tk"):
+        raise ValueError(f"未知的后端：{name!r}（可选 'pillow' / 'tk' / None）")
+    _FORCED = key
+
+
+def backend() -> str:
+    """返回 "pillow" 或 "tk"，表示当前实际可用的图像后端。"""
+    want = _FORCED or _ENV_FORCED
+    if want == "tk":
+        return "tk"
+    have_pil = _pil() is not None
+    if want == "pillow" and have_pil:
+        return "pillow"
+    return "pillow" if have_pil else "tk"
+
+
+def supported_extensions() -> tuple[str, ...]:
+    """当前后端能打开的图片扩展名（小写，带点）。
+
+    pillow: .png .jpg .jpeg .bmp .gif .webp .tif .tiff
+    无 pillow（Tk 自带解码器）: .png .gif .ppm .pgm
+    """
+    return PILLOW_EXTENSIONS if backend() == "pillow" else TK_EXTENSIONS
+
+
+def _magic_ok(path: str, ext: str) -> tuple[bool, str]:
+    """只读文件头 26 字节，廉价判断内容是否像对应格式（Tk 后端用，不解码像素）。"""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(26)
+    except OSError as exc:
+        return False, f"文件读不出来：{exc}"
+    if not head:
+        return False, "文件是空的"
+    if ext == ".png":
+        if not head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return False, "文件内容不是 PNG（可能已损坏或扩展名不对）"
+        # 签名之后必须紧跟 IHDR 块：长度(4) + "IHDR"(4) + 宽(4) + 高(4)
+        if len(head) < 24 or head[12:16] != b"IHDR":
+            return False, "PNG 结构损坏（缺少 IHDR 块）"
+        if struct.unpack(">II", head[16:24]) in ((0, 0), (0xFFFFFFFF, 0xFFFFFFFF)):
+            return False, "PNG 宽高非法，文件已损坏"
+    elif ext == ".gif":
+        if head[:6] not in (b"GIF87a", b"GIF89a") or len(head) < 13:
+            return False, "文件内容不是 GIF（可能已损坏或扩展名不对）"
+    elif ext in (".ppm", ".pgm"):
+        if head[:2] not in (b"P1", b"P2", b"P3", b"P4", b"P5", b"P6") or len(head) < 4:
+            return False, f"文件内容不是 {ext.lstrip('.').upper()}（缺少 P1~P6 魔数）"
+    return True, f"{ext.lstrip('.').upper()} 图片（Tk 后端：已校验文件头，未解码像素）"
+
+
+def can_open(path: object) -> tuple[bool, str]:
+    """(能否打开, 说明文字)，用于界面提示。
+
+    * 文件不存在 → 中文原因；
+    * Tk 后端：扩展名必须在 ``.png/.gif/.ppm/.pgm`` 里，且文件头要对（不做完整解码）；
+    * Pillow 后端：真的尝试打开一次（Pillow 认识的格式比白名单更多），
+      打不开则返回 Pillow 的报错文本。
+    """
+    p = str(path)
+    if not os.path.isfile(p):
+        return False, f"图片不存在：{p}"
+    ext = os.path.splitext(p)[1].lower()
+    if backend() == "pillow":
+        Image = _pil()[0]  # type: ignore[index]
+        try:
+            with Image.open(p) as im:
+                width, height = im.size
+                fmt = str(im.format or ext.lstrip(".").upper())
+        except Exception as exc:  # 打不开的图：给出中文说明 + 原始报错
+            return False, f"无法识别的图片：{ext or '（无扩展名）'}（{exc}）"
+        return True, f"{fmt} 图片，{width}×{height}"
+    if ext not in TK_EXTENSIONS:
+        return False, (f"不支持的图片格式：{ext or '（无扩展名）'}"
+                       f"（当前环境没有 Pillow，仅支持 {'/'.join(TK_EXTENSIONS)}）")
+    ok, detail = _magic_ok(p, ext)
+    return (True, detail) if ok else (False, detail)
+
+
+# --------------------------------------------------------------------------
+# 纯 Python PNG 编码（IHDR 8bit truecolor+alpha → color type 6）
+# --------------------------------------------------------------------------
+
+
+def _chunk(tag: bytes, data: bytes) -> bytes:
+    """PNG 数据块：长度 + 类型 + 数据 + CRC32(类型+数据)。"""
+    return (struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+
+def png_bytes(width: int, height: int, rgba: bytes) -> bytes:
+    """纯 Python PNG 编码器（zlib + struct + crc32），输入 width*height*4 的 RGBA 字节。
+
+    产出 8bit RGBA（color type 6，无隔行），每行前置 filter byte 0。
+    """
+    width, height = int(width), int(height)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"PNG 尺寸必须为正：{width}x{height}")
+    raw = bytes(rgba)
+    expect = width * height * 4
+    if len(raw) != expect:
+        raise ValueError(f"RGBA 字节数不对：期望 {expect}（{width}x{height}x4），实际 {len(raw)}")
+    rows = bytearray()
+    stride = width * 4
+    for y in range(height):  # 每行加 filter byte 0（None）
+        rows.append(0)
+        rows += raw[y * stride:(y + 1) * stride]
+    return (b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + _chunk(b"IDAT", zlib.compress(bytes(rows), 6))
+            + _chunk(b"IEND", b""))
+
+
+def _photo_from_options(master: Optional[tk.Misc], **options: Any) -> tk.PhotoImage:
+    """统一创建 PhotoImage（显式传 master=None 时走 Tk 默认根窗口）。
+
+    还没有 Tk 根窗口时 tkinter 抛的是英文 ``RuntimeError: Too early to create image``，
+    这里统一换成中文的 ``WallpaperError``。
+    """
+    try:
+        return tk.PhotoImage(master=master, **options)
+    except RuntimeError as exc:  # 没有默认根窗口
+        raise WallpaperError(f"创建 Tk 图片失败：{exc}（请先创建 tkinter.Tk() 根窗口）") from exc
+    except tk.TclError as exc:   # 数据本身有问题
+        raise WallpaperError(f"Tk 无法解码图片数据：{exc}") from exc
+
+
+def photo_from_png(data: bytes, master: Optional[tk.Misc] = None) -> tk.PhotoImage:
+    """把 PNG 字节 base64 后交给 tk.PhotoImage(data=...)，Tk 8.6 原生支持 PNG（含 alpha）。
+
+    注意：返回的 PhotoImage 必须由调用方保存引用，否则会被 GC 掉、界面变空白。
+    """
+    payload = base64.b64encode(bytes(data)).decode("ascii")
+    return _photo_from_options(master, data=payload)
+
+
+# --------------------------------------------------------------------------
+# 程序化生成的像素（纯 Python，不依赖 Pillow）
+# --------------------------------------------------------------------------
+
+
+def _solid_rgba(width: int, height: int, color: str, alpha: int) -> bytes:
+    """单色 RGBA 字节。"""
+    width, height = int(width), int(height)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"尺寸必须为正：{width}x{height}")
+    r, g, b = hex_to_rgb(color)
+    a = max(0, min(255, int(alpha)))
+    return bytes((r, g, b, a)) * (width * height)
+
+
+def _noise_rgba(size: int, alpha: int, seed: int) -> bytes:
+    """纸纹噪声的 RGBA 字节：半透明白/黑细颗粒，同 seed 必然同结果。"""
+    size = int(size)
+    if size <= 0:
+        raise ValueError(f"噪声尺寸必须为正：{size}")
+    a_max = max(0, min(255, int(alpha)))
+    rng = random.Random(int(seed))
+    out = bytearray(size * size * 4)
+    i = 0
+    for _ in range(size * size):
+        value = 255 if rng.random() < 0.5 else 0  # 白/黑颗粒各半
+        a = rng.randint(0, a_max)                 # 明暗随机，整体很淡
+        out[i] = value
+        out[i + 1] = value
+        out[i + 2] = value
+        out[i + 3] = a
+        i += 4
+    return bytes(out)
+
+
+def _vignette_rgba(size: int, strength: int) -> bytes:
+    """径向暗角的 RGBA 字节：中心 alpha=0，越靠边越黑，四角达到 strength。"""
+    size = int(size)
+    if size <= 0:
+        raise ValueError(f"暗角尺寸必须为正：{size}")
+    strength = max(0, min(255, int(strength)))
+    half = (size - 1) / 2.0
+    max_r = math.hypot(half, half) or 1.0  # 中心到角的距离，保证四角 r=1
+    out = bytearray(size * size * 4)
+    i = 0
+    for y in range(size):
+        for x in range(size):
+            r = math.hypot(x - half, y - half) / max_r
+            a = int(round(strength * (r ** 1.6)))  # 1.6 次幂：中间更透、边缘压得更实
+            out[i] = 0
+            out[i + 1] = 0
+            out[i + 2] = 0
+            out[i + 3] = max(0, min(255, a))
+            i += 4
+    return bytes(out)
+
+
+def solid_overlay(width: int, height: int, color: str, alpha: int,
+                  master: Optional[tk.Misc] = None) -> tk.PhotoImage:
+    """单色半透明覆盖层（RGBA PNG）。尺寸建议很小（如 4x4），调用方会用 zoom 放大铺满。"""
+    return photo_from_png(png_bytes(width, height, _solid_rgba(width, height, color, alpha)), master)
+
+
+def noise_tile(size: int = 64, alpha: int = 12, seed: int = 7,
+               master: Optional[tk.Misc] = None) -> tk.PhotoImage:
+    """程序化生成的纸纹噪声：半透明白/黑细颗粒，用于给背景加质感。必须确定性（同 seed 同结果）。"""
+    return photo_from_png(png_bytes(size, size, _noise_rgba(size, alpha, seed)), master)
+
+
+def vignette_tile(size: int = 128, strength: int = 70,
+                  master: Optional[tk.Misc] = None) -> tk.PhotoImage:
+    """径向暗角：中心完全透明，越靠边 alpha 越接近 strength（黑色）。"""
+    return photo_from_png(png_bytes(size, size, _vignette_rgba(size, strength)), master)
+
+
+# --------------------------------------------------------------------------
+# Tk 后端：取色与整数缩放
+# --------------------------------------------------------------------------
+
+
+def _tk_get(photo: tk.PhotoImage, x: int, y: int) -> RGB:
+    """读 Tk 图片某点颜色。
+
+    ``PhotoImage.get()`` 在 Python 3 里可能返回 ``(r, g, b)`` 元组，也可能返回
+    ``"r g b"`` 字符串（两者都兼容）；带 alpha 的图只返回 RGB，忽略 alpha。
+    """
+    raw = photo.get(x, y)
+    if isinstance(raw, str):
+        parts = raw.replace(",", " ").split()
+        values = [int(round(float(p))) for p in parts[:3]]
+    else:
+        values: list[int] = []
+        queue = list(raw) if isinstance(raw, (tuple, list)) else [raw]
+        while queue and len(values) < 3:  # 容错：可能是嵌套序列
+            item = queue.pop(0)
+            if isinstance(item, (tuple, list)):
+                queue = list(item) + queue
+            else:
+                values.append(int(round(float(item))))
+    if len(values) < 3:
+        raise WallpaperError(f"无法解析 Tk 像素值：{raw!r}")
+    return (max(0, min(255, values[0])),
+            max(0, min(255, values[1])),
+            max(0, min(255, values[2])))
+
+
+def _tk_predicted(n: int, z: int, s: int) -> int:
+    """预测 zoom(z) 再 subsample(s) 之后的像素数：zoom 是精确乘法，subsample 是向上取整。"""
+    return (n * z + s - 1) // s
+
+
+def _tk_fit(photo: tk.PhotoImage, target: Size, cover: bool) -> tk.PhotoImage:
+    """用整数 zoom/subsample 逼近目标尺寸。
+
+    cover=True ：结果两个方向都 **≥** 目标（居中放置后由 Canvas 裁掉多余部分）；
+    cover=False：结果两个方向都 **≤** 目标（contain / tile 用），且本来就装得下时不放大。
+    搜索 (z, s) 组合时按「多出来的像素最少」挑选，避免白占内存。
+    """
+    w, h = photo.width(), photo.height()
+    tw, th = target
+    if not cover and w <= tw and h <= th:
+        return photo  # 已经装得下：不放大（Tk 放大只是复制像素，没有画质收益）
+
+    best: Optional[tuple[tuple[int, ...], int, int]] = None
+    for s in range(1, 17):
+        for z in range(1, 33):
+            pw, ph = _tk_predicted(w, z, s), _tk_predicted(h, z, s)
+            if cover:
+                if pw < tw or ph < th:
+                    continue
+                score = (pw * ph,)              # 覆盖：超出面积越小越好
+            else:
+                if pw > tw or ph > th:
+                    continue
+                score = (tw * th - pw * ph,)    # 内嵌：离目标越近越好
+            key = score + (z, s)
+            if best is None or key < best[0]:
+                best = (key, z, s)
+    if best is None:  # 极端长宽比：退化成单次 zoom 或单次 subsample
+        if cover:
+            z = max(1, math.ceil(max(tw / w, th / h)))
+            s = 1
+        else:
+            f = min(tw / w, th / h)
+            z = 1
+            s = max(1, math.ceil(1 / f)) if f > 0 else 1
+    else:
+        _, z, s = best
+
+    img = photo
+    if z > 1:
+        img = img.zoom(z)        # 新对象：这里必须持有引用，否则会被 GC
+    if s > 1:
+        img = img.subsample(s)   # 同样是新对象
+    return img
+
+
+# --------------------------------------------------------------------------
+# 壁纸
+# --------------------------------------------------------------------------
+
+
+class Wallpaper:
+    """一张已加载/缩放/着色的壁纸。
+
+    属性
+    ----
+    photo       缩放后的图（cover/stretch 下宽高都 >= 目标；contain/tile 下 <= 目标）
+    size        请求的目标尺寸
+    image_size  实际图片像素尺寸（等于 ``photo`` 的宽高）
+    source_size 原图尺寸
+    mode        模式
+    backend     "pillow" / "tk"
+    dim_in_photo  dim 是否已经混进 photo（只有 pillow + ``bake_dim=True`` 才为 True）
+    """
+
+    photo: tk.PhotoImage
+    size: Size
+    image_size: Size
+    source_size: Size
+    mode: Mode
+    backend: str
+    dim_in_photo: bool
+
+    def __init__(self, path: object, size: Sequence[int], mode: Mode = "cover",
+                 dim: float = 0.25, tint: str = "#000000",
+                 master: Optional[tk.Misc] = None, bake_dim: bool = False) -> None:
+        """加载并缩放壁纸；任何失败都抛 ``WallpaperError``（RuntimeError 子类，中文说明）。
+
+        master / bake_dim 是可选扩展：不传时用 Tk 默认根窗口、dim 一律由覆盖层负责。
+        """
+        self.path = str(path)
+        self.size = (int(size[0]), int(size[1]))
+        self.mode = str(mode).strip().lower()
+        self.dim = max(0.0, min(1.0, float(dim)))
+        self.tint = str(tint)
+        self.backend = backend()
+        self.bake_dim = bool(bake_dim)
+        self._master = master
+        self._img: Optional[Any] = None      # pillow 后端的 RGB 图（tk 后端为 None）
+        self._overlay: Optional[tk.PhotoImage] = None
+
+        if self.size[0] <= 0 or self.size[1] <= 0:
+            raise WallpaperError(f"壁纸目标尺寸无效：{self.size[0]}x{self.size[1]}")
+        if self.mode not in MODES:
+            raise WallpaperError(f"未知的壁纸模式：{mode!r}（可选 {' / '.join(MODES)}）")
+        try:
+            self._tint_rgb = hex_to_rgb(self.tint)
+        except Exception as exc:
+            raise WallpaperError(f"颜色值无法解析：{tint!r}（应形如 #101418）") from exc
+
+        self.photo, self.source_size, self.image_size, self.dim_in_photo = self._load()
+
+    # -- 加载 --------------------------------------------------------------
+
+    def _load(self) -> tuple[tk.PhotoImage, Size, Size, bool]:
+        if not os.path.isfile(self.path):
+            raise WallpaperError(f"图片不存在：{self.path}")
+        if self.backend == "pillow":
+            return self._load_pillow()
+        return self._load_tk()
+
+    def _load_pillow(self) -> tuple[tk.PhotoImage, Size, Size, bool]:
+        from PIL import ImageTk  # type: ignore[import-not-found]
+
+        Image, ImageOps = _pil()  # type: ignore[misc]
+        lanczos = getattr(Image, "LANCZOS", None) or Image.Resampling.LANCZOS
+        try:
+            with Image.open(self.path) as handle:
+                src = handle.convert("RGB")   # 先转 RGB：PNG 带 alpha 也能取色/混合
+        except Exception as exc:
+            raise WallpaperError(f"无法打开图片：{self.path}（{exc}）") from exc
+
+        tw, th = self.size
+        try:
+            if self.mode == "stretch":
+                img = src.resize((tw, th), lanczos)
+            elif self.mode == "cover":
+                # 等比放大到覆盖目标后居中裁剪（多余部分直接丢掉，正好等于目标尺寸）
+                img = ImageOps.fit(src, (tw, th), method=lanczos, centering=(0.5, 0.5))
+            else:  # contain / tile：只缩小不放大
+                img = src
+                if src.width > tw or src.height > th:
+                    img = src.copy()
+                    img.thumbnail((tw, th), lanczos)
+        except Exception as exc:
+            raise WallpaperError(f"缩放图片失败：{self.path}（{exc}）") from exc
+
+        dim_in_photo = False
+        if self.bake_dim and self.dim > 0:
+            img = Image.blend(img, Image.new("RGB", img.size, self._tint_rgb), self.dim)
+            dim_in_photo = True
+
+        try:
+            photo = ImageTk.PhotoImage(img, master=self._master)
+        except RuntimeError as exc:  # 没有默认根窗口
+            raise WallpaperError(f"创建 Tk 图片失败：{exc}（请先创建 tkinter.Tk() 根窗口）") from exc
+        except Exception as exc:
+            raise WallpaperError(f"创建 Tk 图片失败：{exc}") from exc
+        self._img = img
+        return photo, (src.width, src.height), (img.width, img.height), dim_in_photo
+
+    def _load_tk(self) -> tuple[tk.PhotoImage, Size, Size, bool]:
+        ext = os.path.splitext(self.path)[1].lower()
+        if ext not in TK_EXTENSIONS:
+            raise WallpaperError(f"不支持的图片格式：{ext or '（无扩展名）'}"
+                                 f"（当前环境没有 Pillow，仅支持 {'/'.join(TK_EXTENSIONS)}）")
+        try:
+            src = tk.PhotoImage(master=self._master, file=self.path)
+        except RuntimeError as exc:  # 没有默认根窗口
+            raise WallpaperError(f"创建 Tk 图片失败：{exc}（请先创建 tkinter.Tk() 根窗口）") from exc
+        except tk.TclError as exc:   # 文件不是 Tk 能识别的图片 / 已损坏
+            raise WallpaperError(f"无法打开图片：{self.path}（{exc}）") from exc
+
+        # stretch 在 Tk 下也只能整数逼近，同样保证 >= 目标（多出的部分由 Canvas 裁掉）
+        cover = self.mode in ("cover", "stretch")
+        img = _tk_fit(src, self.size, cover=cover)
+        return img, (src.width(), src.height()), (img.width(), img.height()), False
+
+    # -- 取色 --------------------------------------------------------------
+
+    def _pixel(self, x: int, y: int) -> RGB:
+        w, h = self.image_size
+        x = 0 if x < 0 else (w - 1 if x >= w else x)     # 越界 clamp
+        y = 0 if y < 0 else (h - 1 if y >= h else y)
+        if self._img is not None:
+            px = self._img.getpixel((x, y))
+            return (int(px[0]), int(px[1]), int(px[2]))
+        return _tk_get(self.photo, x, y)
+
+    def _view_offset(self) -> tuple[int, int]:
+        """「目标/画布坐标」→「图片像素坐标」的偏移。
+
+        cover 模式下 Tk 后端的图没有被裁剪、而是居中放置，可见区域比图小，
+        所以要加上居中偏移；pillow 后端的图本身已经裁成目标大小，偏移是 0；
+        contain/tile/stretch 都是左上角对齐，偏移同样是 0。
+        有了它，``sample()`` / ``region_color()`` 的坐标系在两种后端下才一致。
+        """
+        if self.mode == "cover" and self._img is None:
+            return (max(0, (self.image_size[0] - self.size[0]) // 2),
+                    max(0, (self.image_size[1] - self.size[1]) // 2))
+        return 0, 0
+
+    def _visible_rect(self) -> tuple[int, int, int, int]:
+        """图片像素坐标下的可见区域（闭区间）。"""
+        ox, oy = self._view_offset()
+        w, h = self.image_size
+        return (ox, oy,
+                min(w - 1, ox + self.size[0] - 1),
+                min(h - 1, oy + self.size[1] - 1))
+
+    def _clamp_canvas(self, x: int, y: int) -> tuple[int, int]:
+        """把「目标/画布坐标」clamp 进目标尺寸内（越界取边缘）。"""
+        w, h = self.size
+        return (0 if x < 0 else (w - 1 if x >= w else x),
+                0 if y < 0 else (h - 1 if y >= h else y))
+
+    @staticmethod
+    def _grid(x0: int, y0: int, x1: int, y1: int, n: int) -> list[tuple[int, int]]:
+        """在闭区间内取 n×n 个格中心点（n=1 时取中点）。"""
+        n = max(1, int(n))
+        points: list[tuple[int, int]] = []
+        for iy in range(n):
+            y = y0 + int((iy + 0.5) * (y1 - y0 + 1) / n)
+            for ix in range(n):
+                x = x0 + int((ix + 0.5) * (x1 - x0 + 1) / n)
+                points.append((x, y))
+        return points
+
+    def average_color(self) -> str:
+        """可见区域的平均色，返回 '#rrggbb'。
+
+        cover 下只有居中裁出来的那块是可见的：pillow 后端的图本身已经裁好并用
+        ``resize((1,1))`` 求均值，Tk 后端则按可见矩形做 ≤400 点网格采样，
+        所以两种后端给的是同一块区域的平均色（数值可能差几个色阶）。
+        """
+        if self._img is not None:
+            Image = _pil()[0]  # type: ignore[index]
+            lanczos = getattr(Image, "LANCZOS", None) or Image.Resampling.LANCZOS
+            px = self._img.resize((1, 1), lanczos).getpixel((0, 0))
+            return rgb_to_hex((int(px[0]), int(px[1]), int(px[2])))
+        x0, y0, x1, y1 = self._visible_rect()
+        pts = self._grid(x0, y0, x1, y1, 20)  # 400 点封顶：大图也不会卡
+        r = sum(self._pixel(x, y)[0] for x, y in pts)
+        g = sum(self._pixel(x, y)[1] for x, y in pts)
+        b = sum(self._pixel(x, y)[2] for x, y in pts)
+        n = len(pts)
+        return rgb_to_hex((r // n, g // n, b // n))
+
+    def sample(self, x: int, y: int) -> str:
+        """取某点颜色（目标/画布坐标系，越界 clamp），返回 '#rrggbb'。
+
+        cover 下会自动换算到居中裁剪出来的那块，因此两种后端的取色坐标一致。
+        """
+        cx, cy = self._clamp_canvas(int(x), int(y))
+        ox, oy = self._view_offset()
+        return rgb_to_hex(self._pixel(cx + ox, cy + oy))
+
+    def region_color(self, x0: int, y0: int, x1: int, y1: int, samples: int = 5) -> str:
+        """区域平均色（网格采样 samples x samples 个点），用于让侧栏/工具栏融入壁纸。
+
+        坐标同样是目标/画布坐标系（和 ``sample()`` 一致，cover 下自动换算）。
+        """
+        ox, oy = self._view_offset()
+        c0x, c0y = self._clamp_canvas(int(x0), int(y0))
+        c1x, c1y = self._clamp_canvas(int(x1), int(y1))
+        ax, bx = sorted((c0x + ox, c1x + ox))
+        ay, by = sorted((c0y + oy, c1y + oy))
+        pts = self._grid(ax, ay, bx, by, min(20, max(1, int(samples))))
+        r = sum(self._pixel(x, y)[0] for x, y in pts)
+        g = sum(self._pixel(x, y)[1] for x, y in pts)
+        b = sum(self._pixel(x, y)[2] for x, y in pts)
+        n = len(pts)
+        return rgb_to_hex((r // n, g // n, b // n))
+
+    # -- 放置与覆盖层 ------------------------------------------------------
+
+    def place(self) -> tuple[str, int, int]:
+        """返回 (anchor, x, y)，供 Canvas.create_image 使用，实现 cover/contain/stretch 的定位。
+
+        cover: 居中裁剪（把图放在画布中心，anchor="center", x=w/2, y=h/2）
+        contain/stretch/tile: anchor="nw", x=0, y=0
+        （tile 模式由调用方自己平铺，这里返回 nw/0/0）
+        """
+        w, h = self.size
+        if self.mode == "cover":
+            return "center", w // 2, h // 2
+        return "nw", 0, 0
+
+    def dim_overlay(self) -> Optional[tk.PhotoImage]:
+        """返回一个 4x4 的单色半透明覆盖层，用于把整张图压暗/染色；dim<=0 时返回 None。
+
+        颜色取 tint，alpha = round(dim*255)。调用方会 zoom 到窗口大小后叠加。
+        返回对象由本实例缓存持有（不会因为调用方忘记保存引用而被 GC），
+        且当 ``dim_in_photo`` 为 True（Pillow 已把 dim 混进 photo）时返回 None，
+        避免同一个 dim 生效两次。
+
+        注意：调用方自己 ``zoom()`` 出来的那张放大覆盖层**必须自己保存引用**
+        （挂到窗口对象上即可），否则 Tk 图片会被 GC 掉、叠加层直接消失。
+        """
+        if self.dim <= 0 or self.dim_in_photo:
+            return None
+        if self._overlay is None:
+            self._overlay = solid_overlay(_OVERLAY_SIZE, _OVERLAY_SIZE, self.tint,
+                                          int(round(self.dim * 255)), self._master)
+        return self._overlay
+
+
+# --------------------------------------------------------------------------
+# 自检
+# --------------------------------------------------------------------------
+
+_TEST_A = "#3366cc"
+_TEST_B = "#cc6633"
+_TEST_W, _TEST_H, _TEST_SPLIT = 160, 120, 100
+
+
+def _write_test_png(path: str) -> None:
+    """生成测试图：左侧 100px 为 #3366cc，右侧 60px 为 #cc6633（都是纯色，方便验证取色）。"""
+    a = hex_to_rgb(_TEST_A)
+    b = hex_to_rgb(_TEST_B)
+    buf = bytearray()
+    for _y in range(_TEST_H):
+        for x in range(_TEST_W):
+            r, g, bl = a if x < _TEST_SPLIT else b
+            buf += bytes((r, g, bl, 255))
+    with open(path, "wb") as handle:
+        handle.write(png_bytes(_TEST_W, _TEST_H, bytes(buf)))
+
+
+def _write_hband_png(path: str) -> None:
+    """生成三条横向色带（上红 / 中绿 / 下蓝）的测试图，用来验证 cover 的坐标换算。"""
+    top, mid, bottom = (200, 30, 30), (30, 180, 60), (40, 60, 220)
+    buf = bytearray()
+    for y in range(120):
+        rgb = top if y < 40 else (mid if y < 80 else bottom)
+        buf += bytes(rgb + (255,)) * 120
+    with open(path, "wb") as handle:
+        handle.write(png_bytes(120, 120, bytes(buf)))
+
+
+def selfcheck(root: tk.Tk) -> list[tuple[str, bool, str]]:
+    """在给定 root 下跑一遍用例，返回 (名称, 是否通过, 说明) 列表。"""
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: str = "") -> bool:
+        results.append((name, bool(ok), detail))
+        return bool(ok)
+
+    # --- 后端与扩展名 ---------------------------------------------------
+    be = backend()
+    have_pil = _pil() is not None
+    check("后端识别", be in ("pillow", "tk") and (be == "pillow") == have_pil,
+          f"backend()={be}，Pillow {'已安装' if have_pil else '未安装'}")
+
+    exts = supported_extensions()
+    expect = PILLOW_EXTENSIONS if be == "pillow" else TK_EXTENSIONS
+    check("扩展名列表", exts == expect and all(e.startswith(".") and e == e.lower() for e in exts),
+          f"{' '.join(exts)}")
+
+    # --- PNG 编码器 -----------------------------------------------------
+    rgba = bytes((0x33, 0x66, 0xCC, 0x80)) * 16
+    data = png_bytes(4, 4, rgba)
+    head = data[:8] == b"\x89PNG\r\n\x1a\n" and data[-8:-4] == b"IEND"  # 尾部：长度(4)+IEND(4)+CRC(4)
+    ihdr = struct.unpack(">IIBBBBB", data[16:29])
+    ph = photo_from_png(data, master=root)
+    check("PNG 编码：签名/IHDR/IEND",
+          head and ihdr == (4, 4, 8, 6, 0, 0, 0),
+          f"signature+iend={head}，IHDR={ihdr}")
+    check("PNG 编码：Tk 解码（含 alpha）",
+          (ph.width(), ph.height()) == (4, 4) and _tk_get(ph, 1, 2) == (0x33, 0x66, 0xCC),
+          f"{ph.width()}x{ph.height()}，像素={_tk_get(ph, 1, 2)}")
+
+    if have_pil:
+        import io
+        from PIL import Image  # type: ignore[import-not-found]
+        with Image.open(io.BytesIO(data)) as im:
+            ok = im.size == (4, 4) and im.mode == "RGBA" and im.getpixel((3, 3)) == (0x33, 0x66, 0xCC, 0x80)
+            detail = f"PIL 解析：{im.size} {im.mode} px={im.getpixel((3, 3))}"
+        check("PNG 编码：PIL 解析", ok, detail)
+    else:
+        check("PNG 编码：PIL 解析", True, "本机没有 Pillow，跳过（已由 Tk 解码校验覆盖）")
+
+    # --- 纸纹噪声 -------------------------------------------------------
+    n1 = _noise_rgba(16, 12, 7)
+    n2 = _noise_rgba(16, 12, 7)
+    n3 = _noise_rgba(16, 12, 8)
+    alphas = n1[3::4]
+    tile = noise_tile(16, 12, 7, master=root)
+    check("纸纹噪声：确定性 + 不超 alpha",
+          n1 == n2 and n1 != n3 and len(n1) == 16 * 16 * 4 and max(alphas) <= 12
+          and (tile.width(), tile.height()) == (16, 16) and min(alphas) == 0,
+          f"同 seed 相同={n1 == n2}，换 seed 不同={n1 != n3}，alpha∈[{min(alphas)},{max(alphas)}]")
+
+    # --- 暗角 -----------------------------------------------------------
+    size_v = 64
+    vig = _vignette_rgba(size_v, 70)
+
+    def v_alpha(x: int, y: int) -> int:
+        return vig[(y * size_v + x) * 4 + 3]
+
+    center, mid, corner = v_alpha(32, 32), v_alpha(32, 10), v_alpha(63, 63)
+    vtile = vignette_tile(size_v, 70, master=root)
+    check("暗角：中心透明、四角最实",
+          center == 0 and corner == 70 and center < mid < corner
+          and (vtile.width(), vtile.height()) == (size_v, size_v),
+          f"中心={center}，距中心 22px={mid}，角落={corner}")
+
+    # --- 纯色覆盖层 -----------------------------------------------------
+    solid = _solid_rgba(4, 4, "#36c", 128)  # 三位简写也要能解析
+    ov = solid_overlay(4, 4, "#36c", 128, master=root)
+    check("纯色覆盖层：颜色 + alpha",
+          solid[:4] == bytes((0x33, 0x66, 0xCC, 128)) and set(solid[3::4]) == {128}
+          and (ov.width(), ov.height()) == (4, 4) and _tk_get(ov, 2, 2) == (0x33, 0x66, 0xCC),
+          f"RGBA(0,0)={tuple(solid[:4])}，PhotoImage={ov.width()}x{ov.height()}")
+
+    # --- 真实 PNG 文件 + 四种模式 ---------------------------------------
+    tmpdir = tempfile.mkdtemp(prefix="wp_selfcheck_")
+    png_path = os.path.join(tmpdir, "wall.png")
+    jpg_path = os.path.join(tmpdir, "fake.jpg")
+    band_path = os.path.join(tmpdir, "bands.png")
+    _write_test_png(png_path)
+    _write_hband_png(band_path)
+    with open(jpg_path, "wb") as handle:
+        handle.write(b"not an image at all")
+
+    def coords(prefix: str) -> None:
+        """cover 的取色坐标：可见区域必须来自图中部（两种后端结果一致）。"""
+        wp = Wallpaper(band_path, (120, 40), mode="cover", master=root)
+        check(f"{prefix}cover 取色坐标：可见区域取自图中部",
+              wp.sample(60, 0) == "#1eb43c" and wp.sample(60, 20) == "#1eb43c"
+              and wp.sample(60, 39) == "#1eb43c" and wp.sample(60, 999) == "#1eb43c"
+              and wp.region_color(0, 0, 119, 39) == "#1eb43c"
+              and wp.average_color() == "#1eb43c",
+              f"可见区上/中/下={wp.sample(60, 0)}/{wp.sample(60, 20)}/{wp.sample(60, 39)}，"
+              f"越界={wp.sample(60, 999)}（clamp 到边缘），平均={wp.average_color()}，"
+              f"图 {wp.image_size}，原图 {wp.source_size}")
+
+    def modes(prefix: str) -> None:
+        """四种模式的尺寸关系与取色（prefix 标注当前后端）。"""
+        target = (100, 40)
+        for mode in MODES:
+            try:
+                wp = Wallpaper(png_path, target, mode=mode, dim=0.25, tint="#101418", master=root)
+            except Exception as exc:
+                check(f"{prefix}{mode}：加载", False, f"{type(exc).__name__}: {exc}")
+                continue
+            w, h = wp.image_size
+            if mode in ("cover", "stretch"):
+                geo_ok = w >= target[0] and h >= target[1]
+            else:
+                geo_ok = w <= target[0] and h <= target[1]
+            left_ok = wp.sample(0, 0) == _TEST_A
+            right_ok = wp.sample(w - 1, 0) == _TEST_B
+            band_a = wp.region_color(0, 0, 20, 10, samples=4)
+            band_b = wp.region_color(w - 10, 0, w - 1, 10, samples=4)
+            avg = wp.average_color()
+            avg_rgb = hex_to_rgb(avg)
+            rgb_a, rgb_b = hex_to_rgb(_TEST_A), hex_to_rgb(_TEST_B)
+            avg_ok = (len(avg) == 7 and avg[0] == "#"
+                      # 平均色必须落在两种取色之间（±1 容差，采样网格造成的取整）
+                      and all(min(rgb_a[i], rgb_b[i]) - 1 <= avg_rgb[i] <= max(rgb_a[i], rgb_b[i]) + 1
+                              for i in range(3)))
+            want_place = ("center", 50, 20) if mode == "cover" else ("nw", 0, 0)
+            check(f"{prefix}{mode}：尺寸/取色/定位",
+                  geo_ok and left_ok and right_ok and band_a == _TEST_A and band_b == _TEST_B
+                  and avg_ok and wp.source_size == (_TEST_W, _TEST_H)
+                  and wp.place() == want_place and wp.backend == backend(),
+                  f"图 {w}x{h}（目标 {target[0]}x{target[1]}），左={wp.sample(0, 0)} "
+                  f"右={wp.sample(w - 1, 0)}，区域左={band_a} 右={band_b}，平均={avg}，"
+                  f"原图={wp.source_size}，place={wp.place()}")
+
+    modes("壁纸·")
+    coords("壁纸·")
+    if be == "pillow":  # 有 Pillow 时也强制跑一遍 Tk 回退路径
+        force_backend("tk")
+        try:
+            check("强制回退：backend()=tk", backend() == "tk", f"backend()={backend()}")
+            modes("壁纸(Tk回退)·")
+            coords("壁纸(Tk回退)·")
+            try:
+                Wallpaper(jpg_path, (10, 10), mode="cover", master=root)
+                check("Tk 回退：拒绝 .jpg 并给出中文原因", False, "居然没有抛异常")
+            except WallpaperError as exc:
+                msg = str(exc)
+                check("Tk 回退：拒绝 .jpg 并给出中文原因",
+                      "不支持的图片格式" in msg and ".jpg" in msg and "Pillow" in msg, msg)
+            except Exception as exc:
+                check("Tk 回退：拒绝 .jpg 并给出中文原因", False,
+                      f"异常类型不对：{type(exc).__name__}: {exc}")
+        finally:
+            force_backend(None)
+
+    # --- wall 参数与覆盖层 ----------------------------------------------
+    wp2 = Wallpaper(png_path, (100, 40), mode="cover", dim=0.25, tint="#102030", master=root)
+    ov2 = wp2.dim_overlay()
+    check("dim_overlay：4x4 + tint 色 + alpha=round(dim*255)",
+          ov2 is not None and (ov2.width(), ov2.height()) == (4, 4)
+          and _tk_get(ov2, 0, 0) == (0x10, 0x20, 0x30)
+          and int(round(0.25 * 255)) == 64 and wp2.dim_in_photo is False,
+          f"{ov2.width()}x{ov2.height()}，色={_tk_get(ov2, 0, 0)}，alpha={int(round(0.25 * 255))}")
+    wp3 = Wallpaper(png_path, (100, 40), mode="cover", dim=0.0, master=root)
+    check("dim_overlay：dim=0 返回 None", wp3.dim_overlay() is None, "dim=0.0")
+
+    if be == "pillow":
+        wp4 = Wallpaper(png_path, (100, 40), mode="cover", dim=0.6, tint="#000000",
+                        master=root, bake_dim=True)
+        plain = Wallpaper(png_path, (100, 40), mode="cover", dim=0.6, master=root)
+        baked = hex_to_rgb(wp4.average_color())
+        raw = hex_to_rgb(plain.average_color())
+        check("bake_dim：Pillow 直接把 dim 混进图里（覆盖层返回 None）",
+              wp4.dim_in_photo and wp4.dim_overlay() is None
+              and all(baked[i] <= raw[i] for i in range(3)),
+              f"混合后={wp4.average_color()}，未混合={plain.average_color()}")
+    else:
+        check("bake_dim：无 Pillow 时退化为覆盖层", True, "Tk 后端没有像素混合，跳过")
+
+    # --- can_open -------------------------------------------------------
+    broken_path = os.path.join(tmpdir, "broken.png")  # 扩展名对、内容是垃圾
+    with open(broken_path, "wb") as handle:
+        handle.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+    ok_png, msg_png = can_open(png_path)
+    ok_jpg, msg_jpg = can_open(jpg_path)
+    ok_broken, msg_broken = can_open(broken_path)
+    ok_none, msg_none = can_open(os.path.join(tmpdir, "根本没有这张图.png"))
+    broken_reason = ("损坏" in msg_broken or "不是" in msg_broken or "无法识别" in msg_broken)
+    check("can_open：真图/假图/坏图/缺文件",
+          ok_png and not ok_jpg and not ok_broken and not ok_none
+          and "不存在" in msg_none and broken_reason
+          and any(c in msg_jpg for c in ("不支持", "无法识别")),
+          f"png→{msg_png} | jpg→{msg_jpg} | 坏 png→{msg_broken} | 缺→{msg_none}")
+    try:
+        Wallpaper(broken_path, (10, 10), master=root)
+        check("坏图：加载时抛中文 WallpaperError", False, "居然没有抛异常")
+    except WallpaperError as exc:
+        check("坏图：加载时抛中文 WallpaperError", "无法打开图片" in str(exc), str(exc))
+
+    # --- 错误路径 -------------------------------------------------------
+    try:
+        Wallpaper(os.path.join(tmpdir, "没有.png"), (10, 10), master=root)
+        check("缺文件：抛中文 WallpaperError", False, "居然没有抛异常")
+    except WallpaperError as exc:
+        check("缺文件：抛中文 WallpaperError", "不存在" in str(exc) and isinstance(exc, RuntimeError),
+              str(exc))
+    try:
+        Wallpaper(png_path, (10, 10), mode="乱来", master=root)
+        check("未知模式：抛中文 WallpaperError", False, "居然没有抛异常")
+    except WallpaperError as exc:
+        check("未知模式：抛中文 WallpaperError", "模式" in str(exc), str(exc))
+    try:
+        png_bytes(2, 2, b"\x00" * 8)
+        check("PNG 编码器：字节数校验", False, "居然没有抛异常")
+    except ValueError as exc:
+        check("PNG 编码器：字节数校验", "字节数" in str(exc), str(exc))
+
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    return results
+
+
+def main() -> int:
+    """命令行自检：``python -m pyreader.wallpaper``（打印 [PASS]/[FAIL] 与后端名）。"""
+    root = tk.Tk()
+    root.withdraw()
+    be = backend()
+    try:
+        results = selfcheck(root)
+    finally:
+        root.destroy()
+    print(f"壁纸模块自检 · 后端={be} · Python {sys.version.split()[0]} · Tk "
+          f"{tk.TkVersion}")
+    failed = 0
+    for name, ok, detail in results:
+        print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  —— {detail}" if detail else ""))
+        failed += 0 if ok else 1
+    print(f"共 {len(results)} 项，通过 {len(results) - failed} 项，失败 {failed} 项")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+==============================================================================
+  文件：pyreader/app.py
+==============================================================================
+"""阅读器主窗口：布局、渲染、交互。
+
+分层：textproc（纯逻辑）→ storage（持久化）→ state（发布订阅）→ app（tkinter UI）。
+本文件只做「把 state 画到控件上」和「把用户操作翻译成 state 变更」两件事，
+所有渲染函数都用「渲染指纹」判重，避免滚动/进度落盘时重建正文控件。
+"""
+
+from __future__ import annotations
+
+import os
+import bisect
+import re
+import subprocess
+import sys
+import time
+import tkinter as tk
+from dataclasses import replace
+from tkinter import colorchooser, filedialog, font as tkfont, messagebox
+from typing import Callable, Dict, List, Optional, Tuple
+
+from . import textproc, theme
+from .state import Store
+from .storage import DEFAULT_SETTINGS, Book, BookMeta, Library, Settings
+
+try:                                   # 壁纸/纹理模块：缺失时自动降级为「无壁纸」
+    from . import wallpaper
+except Exception:                      # pragma: no cover
+    wallpaper = None                   # type: ignore[assignment]
+
+# --------------------------------------------------------------------------
+# 常量
+# --------------------------------------------------------------------------
+
+# 以下尺寸均以「96 DPI 的逻辑像素」书写，使用时统一乘 ReaderApp.scale
+# （见 ReaderApp.S）。这样在 125% / 150% / 200% 缩放下物理尺寸一致，
+# 配合 dpi.enable() 的原生渲染，文字既清晰又不会变小。
+WINDOW_DEFAULT = (960, 680)
+WINDOW_MIN = (720, 480)
+SHELF_WIDTH = 288
+SIDEBAR_WIDTH = 306
+SCROLLBAR_WIDTH = 11
+SHELF_SCROLLBAR_WIDTH = 10
+PAGE_PAD_Y = 30
+PAGE_PAD_X_MIN = 18
+GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)(?:([+-])(\d+)([+-])(\d+))?$")
+
+FONT_SIZE_RANGE = (12, 34)
+LINE_HEIGHT_RANGE = (1.4, 2.6)
+PAGE_WIDTH_RANGE = (520, 1040)
+
+SERIF_STACK = ("Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "SimSun", "宋体",
+               "Georgia", "Times New Roman")
+SANS_STACK = ("Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC",
+              "Hiragino Sans GB", "Segoe UI", "DejaVu Sans")
+UI_STACK = ("Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC",
+            "Hiragino Sans GB", "Segoe UI", "DejaVu Sans")
+
+SAVE_DELAY_MS = 650      # 进度落盘防抖
+SETTINGS_DELAY_MS = 300  # 设置落盘防抖
+
+EMPTY_HINT_TITLE = "开始你的阅读"
+EMPTY_HINT_BODY = (
+    "导入本地 .txt / .md 文件，或直接粘贴文本。\n"
+    "书架、字号、背景色与阅读进度都会保存在本机。"
+)
+EMPTY_HINT_KEYS = "Ctrl+O 导入 · Ctrl+B 书架 · Ctrl+L 目录 · Ctrl+, 设置 · Ctrl+E 护眼 · Ctrl+= / Ctrl+- 字号"
+
+
+def elide(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+class ReaderApp:
+    """整个应用。对外暴露 action_* / set_settings / open_book 等方法便于自动化测试。"""
+
+    # ------------------------------------------------------------------
+    # 构造
+    # ------------------------------------------------------------------
+
+    def __init__(self, root: tk.Tk, library: Library, settings_file: Settings, data_dir: str):
+        self.root = root
+        self.lib = library
+        self.settings_file = settings_file
+        self.data_dir = data_dir
+
+        # 高 DPI：先声明 DPI 感知（由入口在创建窗口前调用 dpi.enable()），
+        # 此时 winfo_fpixels('1i') 会返回真实 DPI（150% → 144；未声明感知则恒为 96）。
+        self.dpi = float(root.winfo_fpixels("1i"))
+        self.scale = max(1.0, self.dpi / 96.0)
+
+        initial = settings_file.load()
+        self.store = Store({
+            "books": [],
+            "books_rev": 0,
+            "current_id": None,
+            "current": None,        # Book
+            "article": None,        # textproc.Article
+            "chapters": [],
+            "settings": initial,
+            "sidebar": initial.get("sidebar"),
+            "progress": 0.0,
+        })
+
+        self._fp = {"reader": object(), "shelf": object(), "sidebar": object(), "toc": object()}
+        self._sig_theme = None
+        self._sig_type = None
+        self._sig_wall = None
+        self._styleable: List[Tuple[tk.Widget, str]] = []
+        self._swatch_borders: Dict[str, tk.Frame] = {}
+        self._swatch_buttons: Dict[str, tk.Frame] = {}
+
+        self._ratio = 0.0            # 已读比例（视口底部字符 / 总字符，到底=1.0）
+        self._char_offset = 0        # 视口首行首字符在全文中的下标（排版无关的精确位置）
+        self._line_offsets: List[int] = []      # 每个逻辑行的首字符下标
+        self._chapter_offsets: List[Tuple[int, int]] = []   # [(章节下标, 字符下标)]
+        self._total_chars = 1
+        self._restoring = False      # 恢复位置期间不回写，避免「越开越偏」
+        self._chapter_lines: List[Tuple[int, int]] = []   # 兼容字段（旧引用）
+        self._save_job: Optional[str] = None
+        self._settings_job: Optional[str] = None
+        self._status_job: Optional[str] = None
+        self._pad_job: Optional[str] = None
+        self._desk_job: Optional[str] = None
+        self._wallpaper_job: Optional[str] = None
+        self._desk_last_size: Tuple[int, int] = (0, 0)
+        self._toc_sync = False
+        self._paste_undo_id: Optional[str] = None      # 上一次粘贴导入的书（Ctrl+Z 撤销）
+
+        self.pal = theme.effective_palette(initial)
+        self.surface = theme.mix(self.pal.chrome, self.pal.bg, 0.6)
+        self.chrome = self.pal.chrome          # 外壳色（有壁纸时会融入壁纸）
+        self.texture: Optional[tk.PhotoImage] = None
+        self.error_color = "#ff8679" if self.pal.dark else "#b3402f"
+
+        self._init_fonts()
+        self._build_ui()
+        self._apply_theme(force=True)
+        self._bind_keys()
+        self.store.subscribe(self._on_state)
+        self._load_library()
+        # 窗口映射后再做视觉初始化（壁纸/纸纹需要真实尺寸）
+        self.root.after(60, self._init_visuals)
+        # 窗口映射之后再落一次设置：既让 settings.json 从首次启动就存在，
+        # 也避免在窗口尚未映射时把 "1x1+0+0" 这种占位几何写进配置。
+        self.root.after(SETTINGS_DELAY_MS + 200, self._flush_settings)
+
+    # ------------------------------------------------------------------
+    # 便捷访问
+    # ------------------------------------------------------------------
+
+    def S(self, px: float) -> int:
+        """96 DPI 逻辑像素 → 本机物理像素。"""
+        return max(1, int(round(px * self.scale)))
+
+    @property
+    def settings(self) -> Dict:
+        """始终返回当前设置（state 是唯一数据源）。"""
+        return self.store.state["settings"]
+
+    @property
+    def current(self) -> Optional[Book]:
+        return self.store.state["current"]
+
+    # ------------------------------------------------------------------
+    # 字体
+    # ------------------------------------------------------------------
+
+    def _init_fonts(self) -> None:
+        families = set(tkfont.families(self.root))
+
+        def pick(stack: Tuple[str, ...], fallback: str) -> str:
+            for name in stack:
+                if name in families:
+                    return name
+            return fallback
+
+        self.ui_family = pick(UI_STACK, "TkDefaultFont")
+        self.read_family = {
+            "serif": pick(SERIF_STACK, self.ui_family),
+            "sans": pick(SANS_STACK, self.ui_family),
+        }
+        size = int(self.settings["font_size"])
+        self.font_body = tkfont.Font(root=self.root, family=self.read_family["serif"], size=size)
+        self.font_h1 = tkfont.Font(root=self.root, family=self.read_family["serif"], size=size + 8, weight="bold")
+        self.font_h2 = tkfont.Font(root=self.root, family=self.read_family["serif"], size=size + 3, weight="bold")
+        self.font_meta = tkfont.Font(root=self.root, family=self.ui_family, size=max(9, size - 5))
+        self.font_empty_h = tkfont.Font(root=self.root, family=self.ui_family, size=size + 2, weight="bold")
+        self.font_empty_p = tkfont.Font(root=self.root, family=self.ui_family, size=max(10, size - 3))
+        self.font_ui = tkfont.Font(root=self.root, family=self.ui_family, size=10)
+        self.font_ui_bold = tkfont.Font(root=self.root, family=self.ui_family, size=10, weight="bold")
+        self.font_ui_small = tkfont.Font(root=self.root, family=self.ui_family, size=9)
+        self.font_title = tkfont.Font(root=self.root, family=self.ui_family, size=11, weight="bold")
+
+    def _sync_fonts(self) -> None:
+        s = self.settings
+        size = int(s["font_size"])
+        family = self.read_family.get(s["font_family"], self.read_family["serif"])
+        self.font_body.configure(family=family, size=size)
+        self.font_h1.configure(family=family, size=size + 8)
+        self.font_h2.configure(family=family, size=size + 3)
+        self.font_meta.configure(size=max(9, size - 5))
+        self.font_empty_h.configure(size=size + 2)
+        self.font_empty_p.configure(size=max(10, size - 3))
+
+    # ------------------------------------------------------------------
+    # 控件工厂（带主题注册，改配色时统一重刷）
+    # ------------------------------------------------------------------
+
+    def _reg(self, widget: tk.Widget, role: str) -> tk.Widget:
+        self._styleable.append((widget, role))
+        return widget
+
+    def _frame(self, parent: tk.Widget, role: str = "chrome.bg", **kw) -> tk.Frame:
+        return self._reg(tk.Frame(parent, bd=0, highlightthickness=0, **kw), role)  # type: ignore[return-value]
+
+    def _label(self, parent: tk.Widget, text: str = "", role: str = "chrome.fg", **kw) -> tk.Label:
+        return self._reg(tk.Label(parent, text=text, bd=0, highlightthickness=0, **kw), role)  # type: ignore[return-value]
+
+    def _button(self, parent: tk.Widget, text: str, command: Callable[[], None],
+                role: str = "chrome.btn", **kw) -> tk.Button:
+        kw.setdefault("padx", self.S(10))
+        kw.setdefault("pady", self.S(4))
+        return self._reg(tk.Button(parent, text=text, command=command, bd=0, highlightthickness=0,
+                                   cursor="hand2", **kw), role)  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # 布局
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        root = self.root
+        root.title("文本阅读器")
+        root.geometry(self._restore_geometry())
+        root.minsize(self.S(WINDOW_MIN[0]), self.S(WINDOW_MIN[1]))
+        root.grid_rowconfigure(2, weight=1)
+        root.grid_columnconfigure(1, weight=1)
+
+        self._build_menu()
+
+        # --- 工具栏 ------------------------------------------------------
+        bar = self.toolbar = self._frame(root, "chrome.bg")
+        bar.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self.btn_shelf = self._button(bar, "☰ 书架", self.toggle_shelf, "chrome.icon")
+        self.btn_shelf.pack(side="left", padx=(self.S(8), self.S(4)), pady=self.S(8))
+        self.label_title = self._label(bar, "文本阅读器", "chrome.title")
+        self.label_title.configure(font=self.font_title, anchor="w")
+        self.label_title.pack(side="left", padx=self.S(6))
+        self.label_progress = self._label(bar, "0%", "chrome.soft")
+        self.label_progress.configure(font=self.font_ui)
+        self.label_progress.pack(side="right", padx=(self.S(4), self.S(10)))
+        self.btn_next = self._button(bar, "▶", lambda: self.jump_chapter(1), "chrome.icon")
+        self.btn_next.pack(side="right", padx=self.S(2), pady=self.S(8))
+        self.btn_prev = self._button(bar, "◀", lambda: self.jump_chapter(-1), "chrome.icon")
+        self.btn_prev.pack(side="right", padx=self.S(2), pady=self.S(8))
+        self.btn_settings = self._button(bar, "Aa 设置", lambda: self.show_sidebar("settings"), "chrome.icon")
+        self.btn_settings.pack(side="right", padx=self.S(4), pady=self.S(8))
+        self.btn_toc = self._button(bar, "目录", lambda: self.show_sidebar("toc"), "chrome.icon")
+        self.btn_toc.pack(side="right", padx=self.S(4), pady=self.S(8))
+        self.btn_eye = self._button(bar, "护眼", self.toggle_eye_care, "chrome.icon")
+        self.btn_eye.pack(side="right", padx=self.S(4), pady=self.S(8))
+        self.btn_paste = self._button(bar, "粘贴", self.action_paste, "chrome.icon")
+        self.btn_paste.pack(side="right", padx=self.S(4), pady=self.S(8))
+        self.btn_import = self._button(bar, "导入文本", self.action_import, "accent.btn")
+        self.btn_import.pack(side="right", padx=self.S(4), pady=self.S(8))
+
+        # --- 顶部进度线（2 逻辑像素） ------------------------------------
+        line_h = self.S(2)
+        self.progress_track = self._reg(tk.Frame(root, height=line_h, bd=0, highlightthickness=0), "line")
+        self.progress_track.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self.progress_fill = tk.Frame(self.progress_track, height=line_h, bd=0, highlightthickness=0,
+                                      bg=self.pal.accent)
+        self.progress_fill.place(x=0, y=0, relwidth=0.0, relheight=1.0)
+
+        # --- 书架列 ------------------------------------------------------
+        self.shelf = self._frame(root, "chrome.bg", width=self.S(SHELF_WIDTH))
+        self.shelf.grid(row=2, column=0, sticky="nsw")
+        self.shelf.grid_propagate(False)
+        head = self._frame(self.shelf, "chrome.bg")
+        head.pack(fill="x", padx=self.S(14), pady=(self.S(14), self.S(6)))
+        self._label(head, "书架", "chrome.soft").pack(side="left")
+        self.label_shelf_count = self._label(head, "0 本", "chrome.soft")
+        self.label_shelf_count.configure(font=self.font_ui_small)
+        self.label_shelf_count.pack(side="right")
+
+        listwrap = self._frame(self.shelf, "chrome.bg")
+        listwrap.pack(fill="both", expand=True, padx=self.S(10))
+        self.shelf_list = tk.Listbox(listwrap, activestyle="none", exportselection=False,
+                                     bd=0, highlightthickness=0, selectmode="browse",
+                                     font=self.font_ui)
+        self.shelf_scroll = tk.Scrollbar(listwrap, orient="vertical", width=self.S(SHELF_SCROLLBAR_WIDTH),
+                                         bd=0, highlightthickness=0, command=self.shelf_list.yview)
+        self.shelf_list.configure(yscrollcommand=self.shelf_scroll.set)
+        self._reg(self.shelf_list, "list")
+        self._reg(self.shelf_scroll, "scrollbar")
+        self.shelf_scroll.pack(side="right", fill="y")
+        self.shelf_list.pack(side="left", fill="both", expand=True)
+        self.shelf_list.bind("<<ListboxSelect>>", self._on_shelf_select)
+        self.shelf_list.bind("<Double-Button-1>", lambda e: self.action_rename())
+
+        self.label_shelf_info = self._label(self.shelf, "", "chrome.soft", justify="left", anchor="w")
+        self.label_shelf_info.configure(font=self.font_ui_small)
+        self.label_shelf_info.pack(fill="x", padx=self.S(16), pady=(self.S(8), self.S(2)))
+
+        tools = self._frame(self.shelf, "chrome.bg")
+        tools.pack(fill="x", padx=self.S(10), pady=(self.S(4), self.S(12)))
+        self._button(tools, "删除", self.action_delete, "chrome.icon").pack(
+            side="left", expand=True, fill="x", padx=self.S(2))
+        self._button(tools, "重命名", self.action_rename, "chrome.icon").pack(
+            side="left", expand=True, fill="x", padx=self.S(2))
+
+        # --- 阅读区：桌面 Canvas（壁纸 + 纸纹）+ 居中「纸页」Text ---------
+        self.reader_wrap = self._frame(root, "page.bg")
+        self.reader_wrap.grid(row=2, column=1, sticky="nsew")
+        self.desk = tk.Canvas(self.reader_wrap, bd=0, highlightthickness=0, takefocus=0)
+        self._reg(self.desk, "page.bg")          # 桌面底色跟随主题（无壁纸时）
+        self.desk.pack(side="left", fill="both", expand=True)
+        self.reader = tk.Text(self.reader_wrap, wrap="word", bd=0, highlightthickness=0,
+                              cursor="arrow", padx=self.S(34), pady=self.S(PAGE_PAD_Y),
+                              spacing1=0, spacing3=self.S(10))
+        self.reader_scroll = tk.Scrollbar(self.reader_wrap, orient="vertical", width=self.S(SCROLLBAR_WIDTH),
+                                          bd=0, highlightthickness=0, command=self._on_scroll)
+        self.reader.configure(yscrollcommand=self._on_yscroll)
+        self._reg(self.reader, "page")
+        self._reg(self.reader_scroll, "scrollbar")
+        self.reader_scroll.pack(side="right", fill="y")
+        self.reader.place(x=0, y=0, width=1, height=1)   # 位置由 _apply_page_layout 计算
+        self.desk.bind("<Configure>", self._on_desk_configure)
+        # 桌面上的图层 id：壁纸 / 纸纹 / 纸页阴影 / 纸页边框
+        self._desk_items: List[int] = []
+        self._texture_photo = None      # 必须保存引用，否则会被 GC
+        self._dim_photo = None          # 放大后的压暗覆盖层
+        self._dim_key = None
+        self._wallpaper = None          # wallpaper.Wallpaper 实例
+        self._wallpaper_tints: Dict[str, str] = {}
+        self._page_rect: Tuple[int, int, int, int] = (0, 0, 0, 0)
+
+        # --- 右侧栏（目录 / 设置，只显示一个） ---------------------------
+        self.sidebar = self._frame(root, "chrome.bg", width=self.S(SIDEBAR_WIDTH))
+        self.sidebar.grid(row=2, column=2, sticky="nse")
+        self.sidebar.grid_propagate(False)
+        side_head = self._frame(self.sidebar, "chrome.bg")
+        side_head.pack(fill="x", padx=self.S(12), pady=(self.S(14), self.S(8)))
+        self.tab_toc = self._button(side_head, "目录", lambda: self.show_sidebar("toc"), "chrome.icon")
+        self.tab_toc.pack(side="left", padx=(0, self.S(6)))
+        self.tab_settings = self._button(side_head, "阅读设置", lambda: self.show_sidebar("settings"), "chrome.icon")
+        self.tab_settings.pack(side="left")
+        self._button(side_head, "✕", lambda: self.show_sidebar(None), "chrome.icon").pack(side="right")
+
+        self.side_body = self._frame(self.sidebar, "chrome.bg")
+        self.side_body.pack(fill="both", expand=True)
+
+        # 侧栏内容可滚动：设置项变多后，小窗口里放不下（壁纸区在下面）
+        self.side_canvas = tk.Canvas(self.side_body, bd=0, highlightthickness=0)
+        self._reg(self.side_canvas, "chrome.bg")
+        self.side_scroll = tk.Scrollbar(self.side_body, orient="vertical", width=self.S(SHELF_SCROLLBAR_WIDTH),
+                                        bd=0, highlightthickness=0, command=self.side_canvas.yview)
+        self._reg(self.side_scroll, "scrollbar")
+        self.side_canvas.configure(yscrollcommand=self.side_scroll.set)
+        self.side_scroll.pack(side="right", fill="y")
+        self.side_canvas.pack(side="left", fill="both", expand=True)
+        self._side_window: Optional[int] = None
+        self.side_canvas.bind("<Configure>", self._on_side_canvas_configure)
+        for widget in (self.sidebar, self.side_canvas):
+            widget.bind("<Enter>", self._bind_side_wheel)
+            widget.bind("<Leave>", self._unbind_side_wheel)
+
+        self.toc_panel = self._frame(self.side_canvas, "chrome.bg")
+        self.toc_list = tk.Listbox(self.toc_panel, activestyle="none", exportselection=False,
+                                   bd=0, highlightthickness=0, selectmode="browse", font=self.font_ui)
+        self._reg(self.toc_list, "list")
+        self.toc_list.pack(fill="both", expand=True, padx=self.S(12), pady=(0, self.S(12)))
+        self.toc_list.bind("<<ListboxSelect>>", self._on_toc_select)
+
+        self.settings_panel = self._build_settings_panel(self.side_canvas)
+
+        # --- 状态栏 ------------------------------------------------------
+        status = self.statusbar = self._frame(root, "chrome.bg")
+        status.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self.status_label = self._label(status, "就绪", "chrome.soft", anchor="w")
+        self.status_label.configure(font=self.font_ui_small)
+        self.status_label.pack(side="left", padx=self.S(12), pady=self.S(5))
+        self.chapter_label = self._label(status, "", "chrome.soft", anchor="w")
+        self.chapter_label.configure(font=self.font_ui_small)
+        self.chapter_label.pack(side="left", padx=self.S(10), pady=self.S(5))
+        self.info_label = self._label(status, "", "chrome.soft", anchor="e")
+        self.info_label.configure(font=self.font_ui_small)
+        self.info_label.pack(side="right", padx=self.S(12), pady=self.S(5))
+
+        self._configure_reader_tags()
+        self._render_empty()
+
+    # ------------------------------------------------------------------
+    # 窗口几何：以「逻辑像素」持久化，换 DPI 后窗口物理尺寸不变
+    # ------------------------------------------------------------------
+
+    def _restore_geometry(self) -> str:
+        raw = str(self.settings.get("window") or "")
+        m = GEOMETRY_RE.match(raw)
+        if not m:
+            return f"{self.S(WINDOW_DEFAULT[0])}x{self.S(WINDOW_DEFAULT[1])}"
+        width, height = self.S(int(m.group(1))), self.S(int(m.group(2)))
+        if m.group(3):
+            return (f"{width}x{height}{m.group(3)}{self.S(int(m.group(4)))}"
+                    f"{m.group(5)}{self.S(int(m.group(6)))}")
+        return f"{width}x{height}"
+
+    def _logical_geometry(self) -> str:
+        """把当前物理几何换算回逻辑像素，写进设置。"""
+        m = GEOMETRY_RE.match(self.root.geometry())
+        if not m:
+            return ""
+        width = int(round(int(m.group(1)) / self.scale))
+        height = int(round(int(m.group(2)) / self.scale))
+        if m.group(3):
+            return (f"{width}x{height}{m.group(3)}{int(round(int(m.group(4)) / self.scale))}"
+                    f"{m.group(5)}{int(round(int(m.group(6)) / self.scale))}")
+        return f"{width}x{height}"
+
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="导入文件…", accelerator="Ctrl+O", command=self.action_import)
+        m_file.add_command(label="粘贴剪贴板内容", accelerator="Ctrl+V", command=self.action_paste)
+        m_file.add_command(label="粘贴并预览…", accelerator="Ctrl+Shift+V", command=self.action_paste_preview)
+        m_file.add_command(label="撤销粘贴", accelerator="Ctrl+Z", command=self.action_undo_paste)
+        m_file.add_separator()
+        m_file.add_command(label="删除当前文本", command=self.action_delete)
+        m_file.add_command(label="重命名当前文本…", command=self.action_rename)
+        m_file.add_separator()
+        m_file.add_command(label="打开数据文件夹", command=self.action_open_data_dir)
+        m_file.add_separator()
+        m_file.add_command(label="退出", accelerator="Ctrl+Q", command=self.on_close)
+        menubar.add_cascade(label="文件", menu=m_file)
+
+        m_view = tk.Menu(menubar, tearoff=0)
+        m_view.add_command(label="书架", accelerator="Ctrl+B", command=self.toggle_shelf)
+        m_view.add_command(label="目录", accelerator="Ctrl+L", command=lambda: self.show_sidebar("toc"))
+        m_view.add_command(label="阅读设置", accelerator="Ctrl+,", command=lambda: self.show_sidebar("settings"))
+        m_view.add_separator()
+        m_view.add_command(label="护眼模式", accelerator="Ctrl+E", command=self.toggle_eye_care)
+        m_view.add_separator()
+        m_view.add_command(label="放大字号", accelerator="Ctrl+=", command=lambda: self.nudge_font(1))
+        m_view.add_command(label="缩小字号", accelerator="Ctrl+-", command=lambda: self.nudge_font(-1))
+        m_view.add_separator()
+        m_view.add_command(label="更换壁纸…", command=self.action_pick_wallpaper)
+        m_view.add_command(label="清除壁纸", command=self.action_clear_wallpaper)
+        m_view.add_command(label="沉浸模式", accelerator="F11", command=self.toggle_immersive)
+        menubar.add_cascade(label="视图", menu=m_view)
+
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="快捷键", command=self.action_shortcuts)
+        m_help.add_command(label="关于", command=self.action_about)
+        menubar.add_cascade(label="帮助", menu=m_help)
+        self.root.configure(menu=menubar)
+        self.menubar = menubar
+
+    def _build_settings_panel(self, parent: tk.Widget) -> tk.Frame:
+        panel = self._frame(parent, "chrome.bg")
+        s = self.settings
+
+        # 字号
+        row, self.scale_font, self.value_font = self._slider_row(
+            panel, "字号", *FONT_SIZE_RANGE, 1, s["font_size"],
+            lambda v: self.set_settings(font_size=int(round(v))),
+            lambda v: f"{int(round(v))} pt")
+        # 行距
+        row, self.scale_line, self.value_line = self._slider_row(
+            panel, "行距", *LINE_HEIGHT_RANGE, 0.05, s["line_height"],
+            lambda v: self.set_settings(line_height=round(float(v), 2)),
+            lambda v: f"{float(v):.2f}")
+        # 页宽
+        row, self.scale_width, self.value_width = self._slider_row(
+            panel, "页宽", *PAGE_WIDTH_RANGE, 20, s["page_width"],
+            lambda v: self.set_settings(page_width=int(round(v))),
+            lambda v: f"{int(round(v))} px")
+
+        # 字体
+        wrap = self._frame(panel, "chrome.bg")
+        wrap.pack(fill="x", padx=self.S(14), pady=(0, self.S(12)))
+        self._label(wrap, "字体", "chrome.fg").pack(anchor="w", pady=(0, self.S(4)))
+        seg = self._frame(wrap, "chrome.bg")
+        seg.pack(fill="x")
+        self.btn_serif = self._button(seg, "衬线（宋体）", lambda: self.set_settings(font_family="serif"), "seg.btn")
+        self.btn_serif.pack(side="left", expand=True, fill="x", padx=(0, self.S(3)))
+        self.btn_sans = self._button(seg, "无衬线（黑体）", lambda: self.set_settings(font_family="sans"), "seg.btn")
+        self.btn_sans.pack(side="left", expand=True, fill="x", padx=(self.S(3), 0))
+
+        # 首行缩进
+        self.var_indent = tk.BooleanVar(value=bool(s["indent"]))
+        self.chk_indent = self._check(panel, "首行缩进（中文排版习惯）", self.var_indent,
+                                      lambda: self.set_settings(indent=self.var_indent.get()))
+
+        # 主题
+        wrap = self._frame(panel, "chrome.bg")
+        wrap.pack(fill="x", padx=self.S(14), pady=(0, self.S(6)))
+        self._label(wrap, "背景色", "chrome.fg").pack(anchor="w", pady=(0, self.S(6)))
+        grid = self._frame(wrap, "chrome.bg")
+        grid.pack(fill="x")
+        for i, (key, spec) in enumerate(theme.THEMES.items()):
+            border = self._frame(grid, "line")
+            border.grid(row=i // 3, column=i % 3, sticky="nsew", padx=self.S(3), pady=self.S(3))
+            btn = tk.Frame(border, bd=0, highlightthickness=0, cursor="hand2")
+            btn.pack(fill="both", expand=True, padx=self.S(2), pady=self.S(2))
+            inner = tk.Label(btn, text=f"Aa\n{spec['name']}", bd=0, highlightthickness=0,
+                             bg=spec["bg"], fg=spec["fg"], font=self.font_ui_small,
+                             justify="center", cursor="hand2")
+            inner.pack(fill="both", expand=True, ipady=self.S(6))
+            inner.bind("<Button-1>", lambda e, k=key: self.set_settings(theme=k))
+            btn.bind("<Button-1>", lambda e, k=key: self.set_settings(theme=k))
+            self._swatch_borders[key] = border
+            self._swatch_buttons[key] = btn
+        for c in range(3):
+            grid.grid_columnconfigure(c, weight=1)
+
+        custom = self._frame(panel, "chrome.bg")
+        custom.pack(fill="x", padx=self.S(14), pady=(self.S(8), self.S(12)))
+        self.btn_bg_color = self._button(custom, "自定义背景…", lambda: self._pick_custom("bg"), "chrome.icon")
+        self.btn_bg_color.pack(side="left", expand=True, fill="x", padx=(0, self.S(3)))
+        self.btn_fg_color = self._button(custom, "自定义文字…", lambda: self._pick_custom("fg"), "chrome.icon")
+        self.btn_fg_color.pack(side="left", expand=True, fill="x", padx=(self.S(3), 0))
+
+        # 护眼
+        self.var_eye = tk.BooleanVar(value=bool(s["eye_care"]))
+        self.chk_eye = self._check(panel, "护眼模式（暖色降蓝光 · 降低对比度）", self.var_eye,
+                                   lambda: self.set_settings(eye_care=self.var_eye.get()), hint=True)
+
+        # ---- 全局壁纸 ----
+        wp = self._frame(panel, "chrome.bg")
+        wp.pack(fill="x", padx=self.S(14), pady=(0, self.S(6)))
+        self._label(wp, "全局壁纸", "chrome.fg").pack(anchor="w", pady=(0, self.S(6)))
+        row = self._frame(wp, "chrome.bg")
+        row.pack(fill="x")
+        self.btn_wallpaper = self._button(row, "选择图片…", self.action_pick_wallpaper, "chrome.icon")
+        self.btn_wallpaper.pack(side="left", expand=True, fill="x", padx=(0, self.S(3)))
+        self._button(row, "清除", self.action_clear_wallpaper, "chrome.icon").pack(
+            side="left", expand=True, fill="x", padx=(self.S(3), 0))
+
+        self.label_wallpaper = self._label(wp, "未设置", "chrome.soft", anchor="w",
+                                           justify="left", wraplength=self.S(260))
+        self.label_wallpaper.configure(font=self.font_ui_small)
+        self.label_wallpaper.pack(fill="x", pady=(self.S(6), 0))
+
+        seg = self._frame(wp, "chrome.bg")
+        seg.pack(fill="x", pady=(self.S(6), 0))
+        self.wallpaper_mode_buttons: Dict[str, tk.Button] = {}
+        for key, name in (("cover", "充满"), ("contain", "适应"), ("tile", "平铺"), ("stretch", "拉伸")):
+            btn = self._button(seg, name, lambda k=key: self.set_settings(wallpaper_mode=k), "seg.btn")
+            btn.pack(side="left", expand=True, fill="x", padx=self.S(1))
+            self.wallpaper_mode_buttons[key] = btn
+
+        _, self.scale_dim, self.value_dim = self._slider_row(
+            wp, "壁纸融合", 0.0, 0.7, 0.05, s["wallpaper_dim"],
+            lambda v: self.set_settings(wallpaper_dim=round(float(v), 2)),
+            lambda v: f"{int(round(float(v) * 100))}%", pad=0)
+        _, self.scale_panel, self.value_panel = self._slider_row(
+            wp, "面板融入", 0.0, 0.6, 0.05, s["wallpaper_panel"],
+            lambda v: self.set_settings(wallpaper_panel=round(float(v), 2)),
+            lambda v: f"{int(round(float(v) * 100))}%", pad=0)
+
+        # ---- 质感 ----
+        self.var_texture = tk.BooleanVar(value=bool(s["texture_on"]))
+        self.chk_texture = self._check(panel, "桌面纸纹（程序化生成，更有质感）", self.var_texture,
+                                       lambda: self.set_settings(texture_on=self.var_texture.get()))
+
+        # 恢复默认
+        self._button(panel, "恢复默认设置", self.action_reset_settings, "chrome.icon").pack(
+            fill="x", padx=self.S(14), pady=self.S(6))
+
+        self.label_storage = self._label(panel, "", "chrome.soft", justify="left", anchor="w",
+                                        wraplength=self.S(266))
+        self.label_storage.configure(font=self.font_ui_small)
+        self.label_storage.pack(fill="x", padx=self.S(14), pady=(self.S(4), self.S(14)))
+        return panel
+
+    def _slider_row(self, parent: tk.Widget, label: str, lo: float, hi: float, res: float,
+                    value: float, on_change: Callable[[float], None],
+                    fmt: Callable[[float], str], pad: int = 14) -> Tuple[tk.Frame, tk.Scale, tk.Label]:
+        row = self._frame(parent, "chrome.bg")
+        row.pack(fill="x", padx=self.S(pad), pady=(0, self.S(10)))
+        head = self._frame(row, "chrome.bg")
+        head.pack(fill="x")
+        self._label(head, label, "chrome.fg").pack(side="left")
+        val = self._label(head, fmt(float(value)), "chrome.soft")
+        val.configure(font=self.font_ui_small)
+        val.pack(side="right")
+        scale = tk.Scale(row, from_=lo, to=hi, resolution=res, orient="horizontal", showvalue=0,
+                         bd=0, highlightthickness=0, sliderlength=self.S(22),
+                         width=self.S(13), length=self.S(200),
+                         command=lambda v: on_change(float(v)))
+        scale.set(value)
+        scale.pack(fill="x")
+        self._reg(scale, "scale")
+        # 值文案随拖动实时更新
+        scale.configure(command=lambda v, f=fmt, lb=val, cb=on_change: (lb.configure(text=f(float(v))), cb(float(v))))
+        return row, scale, val
+
+    def _check(self, parent: tk.Widget, text: str, var: tk.BooleanVar,
+               command: Callable[[], None], hint: bool = False) -> tk.Checkbutton:
+        chk = tk.Checkbutton(parent, text=text, variable=var, command=command, anchor="w",
+                             bd=0, highlightthickness=0, cursor="hand2",
+                             font=self.font_ui)
+        chk.pack(fill="x", padx=self.S(14), pady=(0, self.S(12) if not hint else self.S(16)))
+        return self._reg(chk, "check")  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # 主题
+    # ------------------------------------------------------------------
+
+    def _apply_role(self, widget: tk.Widget, role: str) -> None:
+        p = self.pal
+        c = self.chrome        # 外壳色：无壁纸时 == p.chrome，有壁纸时向壁纸靠拢
+        if role == "chrome.bg":
+            widget.configure(bg=c)
+        elif role == "chrome.fg":
+            widget.configure(bg=c, fg=p.fg)
+        elif role == "chrome.soft":
+            widget.configure(bg=c, fg=p.soft)
+        elif role == "chrome.title":
+            widget.configure(bg=c, fg=p.fg)
+        elif role == "chrome.btn":
+            widget.configure(bg=c, fg=p.fg, activebackground=p.hover, activeforeground=p.fg,
+                             selectbackground=p.hover)
+        elif role == "chrome.icon":
+            widget.configure(bg=c, fg=p.fg, activebackground=p.hover, activeforeground=p.accent,
+                             selectbackground=p.hover, padx=self.S(9), pady=self.S(4))
+        elif role == "accent.btn":
+            widget.configure(bg=p.accent, fg=p.on_accent, activebackground=theme.shade(p.accent, -0.12),
+                             activeforeground=p.on_accent)
+        elif role == "seg.btn":
+            widget.configure(bg=self.surface, fg=p.fg, activebackground=p.hover, activeforeground=p.fg)
+        elif role == "line":
+            widget.configure(bg=theme.mix(p.line, c, 0.35))
+        elif role == "page.bg":
+            widget.configure(bg=p.bg)
+        elif role == "page":
+            widget.configure(bg=p.bg, fg=p.fg, insertbackground=p.fg,
+                             selectbackground=p.accent, selectforeground=p.on_accent)
+        elif role == "list":
+            widget.configure(bg=self.surface, fg=p.fg, selectbackground=p.accent,
+                             selectforeground=p.on_accent, highlightbackground=p.line)
+        elif role == "scrollbar":
+            # Scrollbar: bg 是滑块色，troughcolor 是滑槽色，必须拉开对比才看得见
+            widget.configure(bg=theme.mix(c, p.fg, 0.30), activebackground=p.accent,
+                             troughcolor=p.bg, highlightbackground=c,
+                             bd=0, relief="flat", elementborderwidth=0, activerelief="flat")
+        elif role == "scale":
+            # Scale: bg 同时是控件底色与滑块色，滑槽用 troughcolor，两者对比要够
+            widget.configure(bg=self.surface, fg=p.fg,
+                             troughcolor=theme.mix(c, p.fg, 0.22),
+                             activebackground=p.accent, highlightthickness=0, bd=0,
+                             relief="flat", sliderrelief="raised", elementborderwidth=0)
+        elif role == "check":
+            widget.configure(bg=c, fg=p.fg, activebackground=c, activeforeground=p.fg,
+                             selectcolor=self.surface if p.dark else p.bg)
+
+    def _apply_theme(self, force: bool = False) -> None:
+        s = self.settings
+        sig_theme = (s["theme"], s["custom_bg"], s["custom_fg"], s["eye_care"])
+        sig_type = (s["font_size"], s["line_height"], s["page_width"], s["font_family"], s["indent"])
+        sig_wall = (s["wallpaper_on"], s["wallpaper_path"], s["wallpaper_mode"],
+                    s["wallpaper_dim"], s["wallpaper_panel"],
+                    s["texture_on"], s["texture_strength"])
+        theme_changed = force or sig_theme != self._sig_theme
+        type_changed = force or sig_type != self._sig_type
+        wall_changed = force or sig_wall != self._sig_wall
+        if not (theme_changed or type_changed or wall_changed):
+            return
+        self._sig_theme, self._sig_type, self._sig_wall = sig_theme, sig_type, sig_wall
+
+        self.pal = theme.effective_palette(s)
+        self.surface = theme.mix(self.pal.chrome, self.pal.bg, 0.6)
+        self.error_color = "#ff8679" if self.pal.dark else "#b3402f"
+        if wall_changed and hasattr(self, "desk"):
+            self._refresh_texture()
+            self._set_wallpaper_from_settings()
+        self._refresh_tints()          # 外壳色（有壁纸时向壁纸靠拢）必须在刷控件之前算好
+        if hasattr(self, "progress_fill"):
+            self.progress_fill.configure(bg=self.pal.accent)
+
+        if theme_changed or force:
+            self.root.configure(bg=self.chrome)
+            for widget, role in self._styleable:
+                try:
+                    self._apply_role(widget, role)
+                except tk.TclError:
+                    pass
+            self._paint_swatch_selection()
+            if hasattr(self, "desk"):
+                self._redraw_desk()
+            self._sync_sidebar_buttons()
+
+        if type_changed:
+            self._sync_fonts()
+            # 字号/行距/页宽/缩进变化会重新换行：按字符下标把阅读位置锚回去
+            if self.store.state["current"] and hasattr(self, "desk"):
+                self._apply_page_layout()
+                self._reflow()
+
+        # 段落/标题 tag、内边距、按钮激活态都需要跟着走
+        self._configure_reader_tags()
+        self._sync_segment_buttons()
+        self.label_title.configure(font=self.font_title)
+        self._update_progress_ui(self._ratio)
+
+    def _paint_swatch_selection(self) -> None:
+        current = self.settings["theme"]
+        for key, border in self._swatch_borders.items():
+            border.configure(bg=self.pal.accent if key == current else self.pal.line)
+
+    def _sync_segment_buttons(self) -> None:
+        active = self.settings["font_family"]
+        for btn, key in ((self.btn_serif, "serif"), (self.btn_sans, "sans")):
+            btn.configure(bg=self.pal.accent if active == key else self.surface,
+                          fg=self.pal.on_accent if active == key else self.pal.fg,
+                          activebackground=self.pal.accent if active == key else self.pal.hover)
+
+    # ------------------------------------------------------------------
+    # 正文渲染
+    # ------------------------------------------------------------------
+
+    def _line_gap(self) -> int:
+        lh = float(self.settings["line_height"])
+        base = self.font_body.metrics("linespace")
+        return max(0, int(round(base * (lh - 1.0))))
+
+    def _init_visuals(self) -> None:
+        """首次映射窗口后：纸纹 + 壁纸 + 纸页布局。"""
+        self._apply_page_layout()
+        self._refresh_texture()
+        self._set_wallpaper_from_settings()
+        self._refresh_tints()
+        self._apply_theme(force=True)
+        self._apply_immersive()
+
+    def _refresh_texture(self) -> None:
+        """程序化纸纹（噪声）：给桌面一点质感，纯 Python 生成，无需图片文件。"""
+        on = bool(self.settings.get("texture_on", True)) and wallpaper is not None
+        if not on:
+            self.texture = None
+            self._texture_photo = None
+            if hasattr(self, "desk"):
+                self._redraw_desk()
+            return
+        if self.texture is None:
+            try:
+                # 注意是 alpha=strength：tile 尺寸保持 64（太小会产生上万个画布图元）
+                self.texture = wallpaper.noise_tile(
+                    size=64, alpha=max(0, min(40, int(self.settings.get("texture_strength", 10)))))
+            except Exception:
+                self.texture = None
+        self._texture_photo = self.texture
+        if hasattr(self, "desk"):
+            self._redraw_desk()
+
+    def _refresh_tints(self) -> None:
+        """有壁纸时让外壳颜色向壁纸靠拢，视觉上更统一。"""
+        self.chrome = self.pal.chrome
+        if self._wallpaper is None:
+            return
+        strength = float(self.settings.get("wallpaper_panel", 0.18))
+        if strength <= 0:
+            return
+        try:
+            self.chrome = theme.mix(self.pal.chrome, self._wallpaper.average_color(),
+                                    min(0.6, strength))
+        except Exception:
+            self.chrome = self.pal.chrome
+
+    def _page_pad(self) -> int:
+        """正文在纸页内部左右各留多少（纸页本身的宽度由 _apply_page_layout 决定）。"""
+        return self.S(34)
+
+    # ------------------------------------------------------------------
+    # 桌面：壁纸 / 纸纹 / 纸页阴影
+    # ------------------------------------------------------------------
+
+    DESK_MARGIN_X = 22      # 纸页与桌面左右的最小留白（逻辑像素）
+    DESK_MARGIN_Y = 18
+
+    def _apply_page_layout(self) -> None:
+        """计算纸页位置与宽度，并把 Text 放到 Canvas 上（壁纸因此在四周露出）。"""
+        if not hasattr(self, "desk"):
+            return
+        self.reader_wrap.update_idletasks()
+        avail_w = max(1, self.desk.winfo_width())
+        avail_h = max(1, self.desk.winfo_height())
+        margin_x = self.S(self.DESK_MARGIN_X)
+        margin_y = self.S(self.DESK_MARGIN_Y)
+        want = self.S(int(self.settings["page_width"]))
+        page_w = max(self.S(320), min(want, avail_w - 2 * margin_x))
+        page_h = max(self.S(240), avail_h - 2 * margin_y)
+        page_x = max(margin_x, (avail_w - page_w) // 2)
+        page_y = max(margin_y, (avail_h - page_h) // 2)
+        self._page_rect = (page_x, page_y, page_x + page_w, page_y + page_h)
+        if self._page_rect == getattr(self, "_page_rect_applied", None):
+            return                       # 尺寸没变就别重画（否则会与 <Configure> 互相触发）
+        self._page_rect_applied = self._page_rect
+        self.reader.place_configure(x=page_x, y=page_y, width=page_w, height=page_h)
+        self._redraw_desk()
+
+    def _desk_size(self) -> Tuple[int, int]:
+        return max(1, self.desk.winfo_width()), max(1, self.desk.winfo_height())
+
+    def _redraw_desk(self) -> None:
+        """重画桌面：壁纸 → 纸纹 → 纸页阴影/边框。"""
+        if not hasattr(self, "desk"):
+            return
+        self.desk.delete("all")
+        self._desk_items = []
+        width, height = self._desk_size()
+        p = self.pal
+
+        # 1) 壁纸（Canvas 会自动裁剪超出部分）
+        if self._wallpaper is not None:
+            try:
+                anchor, wx, wy = self._wallpaper.place()
+                self._desk_items.append(self.desk.create_image(wx, wy, anchor=anchor,
+                                                               image=self._wallpaper.photo))
+                overlay = self._dim_overlay_for(width, height)
+                if overlay is not None:
+                    self._desk_items.append(self.desk.create_image(0, 0, anchor="nw", image=overlay))
+            except tk.TclError:
+                pass
+        else:
+            self.desk.configure(bg=p.bg)
+
+        # 2) 纸纹（程序化噪声，平铺；给桌面一点质感）
+        if self._texture_photo is not None:
+            tile_w = self._texture_photo.width()
+            tile_h = self._texture_photo.height()
+            for ty in range(0, height + tile_h, tile_h):
+                for tx in range(0, width + tile_w, tile_w):
+                    self._desk_items.append(self.desk.create_image(tx, ty, anchor="nw",
+                                                                   image=self._texture_photo))
+
+        # 3) 纸页：投影 + 边框（Text 本身不透明，只露出这一圈）
+        x0, y0, x1, y1 = self._page_rect
+        if x1 - x0 > 8 and y1 - y0 > 8:
+            shadow = theme.mix(p.bg, "#000000", 0.35 if not p.dark else 0.6)
+            for i, offset in enumerate((self.S(4), self.S(2))):
+                self.desk.create_rectangle(x0 + offset, y0 + offset, x1 + offset, y1 + offset,
+                                           fill=shadow, outline="", tags="shadow")
+            self.desk.create_rectangle(x0 - 1, y0 - 1, x1 + 1, y1 + 1,
+                                       outline=theme.mix(p.bg, p.fg, 0.18), width=1)
+
+    def _dim_overlay_for(self, width: int, height: int) -> Optional[tk.PhotoImage]:
+        """把 4x4 的半透明压暗层放大到覆盖整个桌面。
+
+        注意：zoom() 会生成**新**的 PhotoImage，必须自己保存引用，
+        否则被 GC 回收后画布上会变成空白（这是 tkinter 的经典坑）。
+        """
+        if self._wallpaper is None:
+            return None
+        small = self._wallpaper.dim_overlay()
+        if small is None:
+            self._dim_photo = None
+            return None
+        tile = max(1, small.width())
+        factor = max(1, -(-max(width, height) // tile))     # 向上取整
+        key = (str(small), factor)
+        if getattr(self, "_dim_key", None) != key:
+            try:
+                self._dim_photo = small.zoom(factor)
+            except tk.TclError:
+                self._dim_photo = small
+            self._dim_key = key
+        return self._dim_photo
+
+    def _set_wallpaper_from_settings(self) -> None:
+        """按设置加载/清除壁纸。加载失败只提示，不影响阅读。"""
+        path = str(self.settings.get("wallpaper_path") or "")
+        if not self.settings.get("wallpaper_on") or not path:
+            self._wallpaper = None
+            self._wallpaper_tints = {}
+            return
+        if wallpaper is None:
+            self._wallpaper = None
+            return
+        width, height = self._desk_size()
+        if width < 8 or height < 8:
+            return                     # 窗口还没映射，等 _init_visuals 再来
+        try:
+            self._wallpaper = wallpaper.Wallpaper(
+                path, (width, height),
+                mode=str(self.settings.get("wallpaper_mode", "cover")),
+                dim=float(self.settings.get("wallpaper_dim", 0.28)),
+                tint=self.pal.bg)
+            self._wallpaper_tints = self._panel_tints()
+        except Exception as exc:  # noqa: BLE001 - 壁纸坏了不能影响阅读
+            self._wallpaper = None
+            self._wallpaper_tints = {}
+            self.status(f"壁纸加载失败：{exc}", error=True)
+
+    def _panel_tints(self) -> Dict[str, str]:
+        """从壁纸上取各面板区域的平均色，让外壳「融入」壁纸。"""
+        if self._wallpaper is None:
+            return {}
+        strength = float(self.settings.get("wallpaper_panel", 0.18))
+        if strength <= 0:
+            return {}
+        width, height = self._desk_size()
+        regions = {
+            "toolbar": (0, 0, width, self.S(56)),
+            "shelf": (0, 0, self.S(SHELF_WIDTH), height),
+            "sidebar": (width - self.S(SIDEBAR_WIDTH), 0, width, height),
+            "status": (0, height - self.S(30), width, height),
+        }
+        out: Dict[str, str] = {}
+        for key, box in regions.items():
+            try:
+                colour = self._wallpaper.region_color(*box)
+            except Exception:
+                continue
+            out[key] = theme.mix(self.pal.chrome, colour, min(0.6, strength))
+        return out
+
+    def _configure_reader_tags(self) -> None:
+        if not hasattr(self, "reader"):
+            return
+        p = self.pal
+        s = self.settings
+        gap = self._line_gap()
+        indent = self.font_body.measure("\u3000\u3000") if s["indent"] else 0
+        self.reader.configure(bg=p.bg, fg=p.fg, spacing1=0, spacing2=gap, spacing3=gap,
+                              padx=self._page_pad(), pady=self.S(PAGE_PAD_Y), insertwidth=0)
+        self.reader.tag_configure("p", font=self.font_body, foreground=p.fg,
+                                  spacing2=gap, spacing3=gap, lmargin1=indent, lmargin2=0)
+        self.reader.tag_configure("h1", font=self.font_h1, foreground=p.fg,
+                                  spacing1=self.S(4), spacing3=self.S(8))
+        self.reader.tag_configure("meta", font=self.font_meta, foreground=p.soft,
+                                  spacing3=self.S(26))
+        self.reader.tag_configure("h2", font=self.font_h2, foreground=p.fg,
+                                  spacing1=self.S(26), spacing3=self.S(16))
+        self.reader.tag_configure("empty_h", font=self.font_empty_h, foreground=p.fg,
+                                  justify="center", spacing1=self.S(110), spacing3=self.S(12))
+        self.reader.tag_configure("empty_p", font=self.font_empty_p, foreground=p.soft,
+                                  justify="center", spacing2=self.S(6), spacing3=self.S(10))
+
+    def _on_state(self, state: Dict, prev: Dict) -> None:
+        if state["settings"] is not prev["settings"]:
+            self._apply_theme()
+            self._sync_settings_controls()
+        self._render_chrome(state)
+        self._render_shelf(state)
+        self._render_reader(state, prev)
+        self._render_sidebar(state)
+
+    def _render_chrome(self, state: Dict) -> None:
+        book: Optional[Book] = state["current"]
+        art: Optional[textproc.Article] = state["article"]
+        if book and art:
+            self.label_title.configure(
+                text=f"{elide(book.meta.title, 42)}    {art.chars:,} 字 · "
+                     f"{len(state['chapters']) - 1} 章" if len(state["chapters"]) > 1
+                     else f"{elide(book.meta.title, 42)}    {art.chars:,} 字 · 无章节")
+            self.info_label.configure(
+                text=f"{textproc.human_size(book.meta.size)} · {book.meta.encoding} · "
+                     f"{self._storage_label()}")
+        else:
+            self.label_title.configure(text="文本阅读器    未选择文本")
+            self.info_label.configure(text=self._storage_label())
+        self.btn_eye.configure(bg=self.pal.accent if self.settings["eye_care"] else self.pal.chrome,
+                               fg=self.pal.on_accent if self.settings["eye_care"] else self.pal.fg)
+        self.btn_toc.configure(state="normal" if book else "disabled")
+        self._sync_sidebar_buttons()
+
+    def _storage_label(self) -> str:
+        return f"书库 {self.lib.count()} 本 · SQLite · {os.path.basename(self.data_dir)}"
+
+    def action_open_data_dir(self) -> None:
+        """便携模式下数据就在程序目录里，一键打开方便备份。"""
+        path = str(self.data_dir)
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)                     # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            self.status(f"数据目录：{path}")
+        except Exception as exc:                       # noqa: BLE001
+            messagebox.showinfo("数据目录", f"{path}\n\n（自动打开失败：{exc}）", parent=self.root)
+
+    def _render_reader(self, state: Dict, prev: Dict) -> None:
+        current_id = state["current_id"]
+        if current_id == self._fp["reader"] and prev.get("current_id") == current_id:
+            return
+        self._fp["reader"] = current_id
+        book: Optional[Book] = state["current"]
+        art: Optional[textproc.Article] = state["article"]
+        if not book or not art:
+            self._render_empty()
+            self._reset_position()
+            self._update_progress_ui(0.0)
+            return
+
+        text = self.reader
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        # 一边插入一边记录「每个逻辑行首字符在全文中的下标」。
+        # 后面用字符下标定位/还原：改字号、改页宽、改窗口大小都不会漂。
+        offsets: List[int] = []
+        cursor = 0
+        for block in art.blocks:
+            offsets.append(cursor)
+            text.insert("end", block.text + "\n", block.kind)
+            cursor += len(block.text) + 1
+        text.configure(state="disabled")
+        self._line_offsets = offsets
+        self._total_chars = max(1, cursor)
+        self._chapter_offsets = [
+            (idx, offsets[ch.block_index] if ch.block_index < len(offsets) else 0)
+            for idx, ch in enumerate(art.chapters)
+        ]
+        self._chapter_lines = [(idx, 1) for idx, _ in self._chapter_offsets]   # 兼容旧引用
+        self._render_toc_list(state)
+        self._restore_position(book.meta)
+
+    # ---------------- 位置换算：字符下标 ⇄ 控件索引 ----------------
+
+    def _index_to_offset(self, index: str) -> int:
+        """把 Tk 的 '行.列' 索引换算成全文字符下标。"""
+        try:
+            line_s, col_s = str(index).split(".")
+            line, col = int(line_s), int(col_s)
+        except ValueError:
+            return 0
+        offsets = self._line_offsets
+        if not offsets:
+            return 0
+        line = max(1, min(line, len(offsets)))
+        return max(0, offsets[line - 1] + col)
+
+    def _offset_to_index(self, offset: int) -> str:
+        """字符下标 → Tk 索引（二分反查行号）。"""
+        offsets = self._line_offsets
+        if not offsets:
+            return "1.0"
+        offset = max(0, min(int(offset), self._total_chars))
+        line = bisect.bisect_right(offsets, offset)
+        line = max(1, min(line, len(offsets)))
+        return f"{line}.{max(0, offset - offsets[line - 1])}"
+
+    def _current_ratio(self) -> float:
+        """已读比例：视口底部字符 / 总字符；末尾已进入视口就算 100%（已读完）。"""
+        _first, last = self.reader.yview()
+        if float(last) >= 0.9995:
+            return 1.0
+        height = max(2, self.reader.winfo_height())
+        bottom = self.reader.index(f"@0,{height - 4}")
+        if self.reader.compare(bottom, ">=", "end-2c"):
+            return 1.0
+        return max(0.0, min(1.0, self._index_to_offset(bottom) / self._total_chars))
+
+    def _reset_position(self) -> None:
+        self._ratio = 0.0
+        self._char_offset = 0
+        self._line_offsets = []
+        self._chapter_offsets = []
+        self._chapter_lines = []
+        self._total_chars = 1
+        self._restoring = False
+
+    def _restore_position(self, meta: BookMeta) -> None:
+        """按字符下标精确恢复；老数据没有 char_offset 时退回比例。"""
+        self._restoring = True
+        try:
+            self.reader.update_idletasks()
+            if meta.char_offset > 0:
+                self.reader.yview(self._offset_to_index(meta.char_offset))
+            elif meta.progress > 0:
+                self.reader.yview_moveto(float(meta.progress))
+            else:
+                self.reader.yview_moveto(0.0)
+            self._sync_from_view(initial=True)
+        finally:
+            # 等布局定型再解除静默；期间不接受滚动事件，避免把中间态写回库
+            self.root.after(140, lambda bid=meta.id: self._end_restore(bid))
+
+    def _end_restore(self, book_id: Optional[str] = None) -> None:
+        # 期间用户可能已经翻到别的书了，那就别再拿旧书的控件状态去刷 UI
+        if book_id is not None and self.store.state["current_id"] != book_id:
+            self._restoring = False
+            return
+        self._restoring = False
+        self._sync_from_view()
+        self._sync_toc_selection()
+
+    def _update_chapter_label(self) -> None:
+        """状态栏显示「第 n/N 节 · 标题」，只在变化时刷新。"""
+        if not hasattr(self, "chapter_label"):
+            return
+        chapters = self.store.state["chapters"]
+        if not self.store.state["current"] or not self._chapter_offsets:
+            text = ""
+        else:
+            index = self.current_chapter_index()
+            title = chapters[index].title if index < len(chapters) else ""
+            text = f"第 {index + 1}/{len(self._chapter_offsets)} 节 · {elide(title, 18)}"
+        if text != getattr(self, "_chapter_label_text", None):
+            self._chapter_label_text = text
+            self.chapter_label.configure(text=text)
+
+    def _sync_from_view(self, initial: bool = False) -> None:
+        """从控件真实位置推出 (字符下标, 已读比例)，变化时刷新 UI 并安排落盘。"""
+        if not self.store.state["current"]:
+            return
+        offset = self._index_to_offset(self.reader.index("@0,0"))
+        ratio = self._current_ratio()
+        changed = initial or offset != self._char_offset or abs(ratio - self._ratio) > 1e-4
+        self._char_offset, self._ratio = offset, ratio
+        if not changed:
+            return
+        self._update_progress_ui(ratio)
+        self._update_chapter_label()
+        if not initial:
+            self._sync_toc_selection()
+            self._schedule_save()
+
+    def _render_empty(self) -> None:
+        text = self.reader
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("end", EMPTY_HINT_TITLE + "\n", "empty_h")
+        text.insert("end", EMPTY_HINT_BODY + "\n", "empty_p")
+        text.insert("end", "\n", "empty_p")
+        text.insert("end", EMPTY_HINT_KEYS + "\n", "empty_p")
+        text.configure(state="disabled")
+
+    # ------------------------------------------------------------------
+    # 书架
+    # ------------------------------------------------------------------
+
+    def _render_shelf(self, state: Dict) -> None:
+        key = (state["books_rev"], state["current_id"])
+        if key == self._fp["shelf"]:
+            return
+        self._fp["shelf"] = key
+        books: List[BookMeta] = state["books"]
+        self.label_shelf_count.configure(text=f"{len(books)} 本")
+        self.shelf_list.delete(0, "end")
+        for i, meta in enumerate(books):
+            self.shelf_list.insert("end", self._shelf_row(meta))
+            self._paint_shelf_item(i, meta)
+        if not books:
+            self.label_shelf_info.configure(text="书架还是空的：\n点「导入文本」或拖入文件。")
+        else:
+            index = next((i for i, m in enumerate(books) if m.id == state["current_id"]), -1)
+            if index >= 0:
+                self.shelf_list.selection_clear(0, "end")
+                self.shelf_list.selection_set(index)
+                self.shelf_list.see(index)
+                self.shelf_list.activate(index)
+            self._refresh_shelf_info()
+
+    def _shelf_row(self, meta: BookMeta) -> str:
+        return f"▍{elide(meta.title, 20)}   ·  {meta.percent_text}"
+
+    def _refresh_shelf_info(self, meta: Optional[BookMeta] = None) -> None:
+        if meta is None:
+            book: Optional[Book] = self.store.state["current"]
+            meta = book.meta if book else None
+        if meta is None:
+            self.label_shelf_info.configure(text="")
+            return
+        when = time.strftime("%m-%d %H:%M", time.localtime(meta.last_read_at)) if meta.last_read_at else "—"
+        self.label_shelf_info.configure(
+            text=f"{textproc.human_size(meta.size)} · {meta.encoding}\n"
+                 f"进度 {meta.percent_text} · 最近阅读 {when}")
+
+    def _paint_shelf_progress(self, meta: BookMeta) -> None:
+        """只改一行，不重建整个列表（每次进度落盘都会调用）。"""
+        books: List[BookMeta] = self.store.state["books"]
+        for i, item in enumerate(books):
+            if item.id == meta.id:
+                books[i] = meta
+                self.shelf_list.delete(i)
+                self.shelf_list.insert(i, self._shelf_row(meta))
+                self.shelf_list.selection_clear(0, "end")
+                self.shelf_list.selection_set(i)
+                self._paint_shelf_item(i, meta)
+                self._refresh_shelf_info(meta)
+                return
+
+    def _paint_shelf_item(self, index: int, meta: BookMeta) -> None:
+        """给书架行上「书脊色 + 进度底纹」：当前这本用强调色，其余用书封面色的淡色。"""
+        current = meta.id == self.store.state["current_id"]
+        spine = self._spine_color(meta)
+        if current:
+            bg = self.pal.hover
+        else:
+            bg = theme.mix(self.surface, spine, 0.10)
+        try:
+            self.shelf_list.itemconfig(index, background=bg,
+                                       foreground=self.pal.fg,
+                                       selectbackground=self.pal.accent,
+                                       selectforeground=self.pal.on_accent)
+        except tk.TclError:
+            pass
+
+    def _spine_color(self, meta: BookMeta) -> str:
+        """书名 → 稳定色相：同一本书永远同一个书脊颜色。"""
+        base = sum((i + 1) * ord(c) for i, c in enumerate(meta.title)) % 360
+        return theme.hsv_to_hex(base, 0.34 if not self.pal.dark else 0.42,
+                                0.72 if not self.pal.dark else 0.85)
+
+    # ------------------------------------------------------------------
+    # 目录与侧栏
+    # ------------------------------------------------------------------
+
+    def _render_toc_list(self, state: Dict) -> None:
+        chapters: List[textproc.Chapter] = state["chapters"]
+        if not state["current"]:
+            self.toc_list.delete(0, "end")
+            return
+        self.toc_list.delete(0, "end")
+        if len(chapters) > 1:
+            for ch in chapters:
+                self.toc_list.insert("end", elide(ch.title, 26))
+        else:
+            self.toc_list.insert("end", "未识别到章节")
+            self.toc_list.insert("end", "支持：第一章 / Chapter 1")
+            self.toc_list.insert("end", "序章 / # 标题")
+
+    def _render_sidebar(self, state: Dict) -> None:
+        key = (state["sidebar"], state["current_id"] if state["sidebar"] == "toc" else None)
+        if key == self._fp["sidebar"]:
+            return
+        self._fp["sidebar"] = key
+        sidebar = state["sidebar"]
+        if sidebar is None:
+            self.sidebar.grid_remove()
+        else:
+            self.sidebar.grid()
+        self.toc_panel.pack_forget()
+        self.settings_panel.pack_forget()
+        if self._side_window is not None:
+            self.side_canvas.delete(self._side_window)
+            self._side_window = None
+        if sidebar == "toc":
+            self._side_window = self.side_canvas.create_window(
+                0, 0, window=self.toc_panel, anchor="nw")
+            self._render_toc_list(state)
+            self._sync_toc_selection()
+        elif sidebar == "settings":
+            self._side_window = self.side_canvas.create_window(
+                0, 0, window=self.settings_panel, anchor="nw")
+            self._sync_settings_controls()
+        self._on_side_canvas_configure()
+        self.root.after(30, self.refresh_side_scroll)
+        self._sync_sidebar_buttons()
+
+    # ------------------------------------------------------------------
+    # 可滚动侧栏
+    # ------------------------------------------------------------------
+
+    def _on_side_canvas_configure(self, _event=None) -> None:
+        if self._side_window is not None:
+            self.side_canvas.itemconfigure(self._side_window, width=self.side_canvas.winfo_width())
+        self.side_canvas.configure(scrollregion=self.side_canvas.bbox("all"))
+
+    def refresh_side_scroll(self) -> None:
+        self.side_canvas.update_idletasks()
+        self.side_canvas.configure(scrollregion=self.side_canvas.bbox("all"))
+        bbox = self.side_canvas.bbox("all")
+        need = bool(bbox) and bbox[3] > self.side_canvas.winfo_height() + 2
+        if need:
+            self.side_scroll.pack(side="right", fill="y")
+        else:
+            self.side_scroll.pack_forget()
+            self.side_canvas.yview_moveto(0.0)
+
+    def _bind_side_wheel(self, _event=None) -> None:
+        self.root.bind_all("<MouseWheel>", self._on_side_wheel, add="+")
+
+    def _unbind_side_wheel(self, _event=None) -> None:
+        self.root.unbind_all("<MouseWheel>")
+
+    def _on_side_wheel(self, event) -> str:
+        bbox = self.side_canvas.bbox("all")
+        if not bbox or bbox[3] <= self.side_canvas.winfo_height() + 2:
+            return ""                       # 内容放得下就不用滚
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta == 0:
+            delta = 120 if int(getattr(event, "num", 0) or 0) == 4 else -120
+        self.side_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+        return "break"
+
+    def _sync_sidebar_buttons(self) -> None:
+        sidebar = self.store.state["sidebar"]
+        for btn, key in ((self.btn_toc, "toc"), (self.btn_settings, "settings"),
+                         (self.tab_toc, "toc"), (self.tab_settings, "settings")):
+            on = sidebar == key
+            btn.configure(bg=self.pal.accent if on else self.pal.chrome,
+                          fg=self.pal.on_accent if on else self.pal.fg)
+
+    def _sync_settings_controls(self) -> None:
+        s = self.settings
+        for scale, value in ((self.scale_font, s["font_size"]),
+                             (self.scale_line, s["line_height"]),
+                             (self.scale_width, s["page_width"])):
+            if abs(float(scale.get()) - float(value)) > 1e-9:
+                scale.set(value)
+        self.value_font.configure(text=f"{int(s['font_size'])} pt")
+        self.value_line.configure(text=f"{float(s['line_height']):.2f}")
+        self.value_width.configure(text=f"{int(s['page_width'])} px")
+        self.var_indent.set(bool(s["indent"]))
+        self.var_eye.set(bool(s["eye_care"]))
+        self.var_texture.set(bool(s["texture_on"]))
+        for scale, value in ((self.scale_dim, s["wallpaper_dim"]),
+                             (self.scale_panel, s["wallpaper_panel"])):
+            if abs(float(scale.get()) - float(value)) > 1e-9:
+                scale.set(value)
+        self.value_dim.configure(text=f"{int(round(float(s['wallpaper_dim']) * 100))}%")
+        self.value_panel.configure(text=f"{int(round(float(s['wallpaper_panel']) * 100))}%")
+        active = str(s.get("wallpaper_mode", "cover"))
+        for key, btn in self.wallpaper_mode_buttons.items():
+            btn.configure(bg=self.pal.accent if key == active else self.surface,
+                          fg=self.pal.on_accent if key == active else self.pal.fg)
+        path = str(s.get("wallpaper_path") or "")
+        if not path:
+            self.label_wallpaper.configure(text="未设置（点「选择图片…」）")
+        elif not s.get("wallpaper_on"):
+            self.label_wallpaper.configure(text=f"已选择：{os.path.basename(path)}\n当前为关闭状态")
+        else:
+            backend_name = getattr(wallpaper, "backend", lambda: "?")() if wallpaper else "?"
+            self.label_wallpaper.configure(
+                text=f"当前：{os.path.basename(path)}\n缩放后端：{backend_name}")
+        self._paint_swatch_selection()
+        self._sync_segment_buttons()
+        self._sync_sidebar_buttons()
+
+    def show_sidebar(self, which: Optional[str]) -> None:
+        if which and self.settings.get("immersive"):
+            self.set_settings(immersive=False)      # 打开面板时自动退出沉浸
+        current = self.store.state["sidebar"]
+        self.store.set({"sidebar": None if current == which else which})
+        self._schedule_settings_flush()   # 侧栏选择也要记住
+
+    def toggle_shelf(self) -> None:
+        s = dict(self.settings)
+        s["shelf_open"] = not s["shelf_open"]
+        self._apply_settings(s)
+
+    def _sync_shelf_visibility(self) -> None:
+        show = bool(self.settings["shelf_open"]) and not bool(self.settings.get("immersive"))
+        if show:
+            self.shelf.grid()
+            self.btn_shelf.configure(text="☰ 书架")
+        else:
+            self.shelf.grid_remove()
+            self.btn_shelf.configure(text="☰")
+
+    # ------------------------------------------------------------------
+    # 进度
+    # ------------------------------------------------------------------
+
+    def _on_scroll(self, *args) -> None:
+        self.reader.yview(*args)
+        self._on_view_changed()
+
+    def _on_yscroll(self, first, last) -> None:
+        self.reader_scroll.set(first, last)
+        if not getattr(self, "_yscroll_pending", False):
+            self._yscroll_pending = True
+            self.root.after_idle(self._after_yscroll)
+
+    def _after_yscroll(self) -> None:
+        self._yscroll_pending = False
+        self._on_view_changed()
+
+    def _on_view_changed(self) -> None:
+        if self._restoring or not self.store.state["current"]:
+            return
+        self._sync_from_view()
+
+    def _update_progress_ui(self, ratio: float) -> None:
+        ratio = max(0.0, min(1.0, float(ratio)))
+        self.label_progress.configure(text="已读完" if ratio >= 0.999 else f"{int(round(ratio * 100))}%")
+        self.progress_fill.place_configure(relwidth=ratio)
+
+    def _schedule_save(self) -> None:
+        if self._save_job:
+            self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(SAVE_DELAY_MS, self.save_progress)
+
+    def save_progress(self, force: bool = False) -> None:
+        """把 (已读比例, 字符下标) 一起落库；字符下标是精确位置，比例用于显示。"""
+        self._save_job = None
+        book: Optional[Book] = self.store.state["current"]
+        if not book:
+            return
+        # 恢复位置期间不接受「自动」保存（那时布局还没定型），但强制保存（关窗/切书）必须照做
+        if self._restoring and not force:
+            return
+        ratio = self._current_ratio()
+        offset = self._index_to_offset(self.reader.index("@0,0"))
+        if not force and offset == book.meta.char_offset and abs(ratio - book.meta.progress) < 0.002:
+            return
+        self.lib.set_progress(book.meta.id, ratio, offset)
+        meta = replace(book.meta, progress=ratio, char_offset=offset,
+                       progress_updated_at=time.time())
+        self._char_offset, self._ratio = offset, ratio
+        self.store.set({"current": replace(book, meta=meta)})   # 指纹不变，不会重建正文
+        self._paint_shelf_progress(meta)
+        self.label_progress.configure(fg=self.pal.accent)
+        self.root.after(900, lambda: self.label_progress.configure(fg=self.pal.soft))
+
+    def _sync_toc_selection(self) -> None:
+        if self.store.state["sidebar"] != "toc" or not self._chapter_offsets:
+            return
+        if self.toc_list.size() != len(self.store.state["chapters"]):
+            return
+        index = 0
+        for idx, offset in self._chapter_offsets:
+            if offset <= self._char_offset:
+                index = idx
+            else:
+                break
+        if self.toc_list.curselection() and self.toc_list.curselection()[0] == index:
+            return
+        self._toc_sync = True
+        try:
+            self.toc_list.selection_clear(0, "end")
+            self.toc_list.selection_set(index)
+            self.toc_list.see(index)
+        finally:
+            self._toc_sync = False
+
+    # ------------------------------------------------------------------
+    # 交互：导入 / 粘贴 / 删除 / 重命名
+    # ------------------------------------------------------------------
+
+    def action_import(self) -> None:
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="导入文本",
+            filetypes=[("文本文件", "*.txt *.md *.markdown *.text *.log"), ("所有文件", "*.*")])
+        if paths:
+            self.import_paths(list(paths))
+
+    def import_paths(self, paths: List[str]) -> int:
+        """导入若干文件，返回成功数量。供菜单与自动化测试共用。"""
+        added: List[BookMeta] = []
+        skipped: List[str] = []
+        for path in paths:
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError as exc:
+                skipped.append(f"{os.path.basename(path)}（{exc.strerror or exc}）")
+                continue
+            text, encoding = textproc.decode_bytes(data)
+            if not text.strip():
+                skipped.append(f"{os.path.basename(path)}（内容为空）")
+                continue
+            title = textproc.guess_title(os.path.basename(path), text)
+            added.append(self.lib.add(title, text, encoding, size=len(data)))
+        if added:
+            self._reload_library(open_id=added[-1].id)
+            msg = f"已导入 {len(added)} 个文件"
+            if skipped:
+                msg += f"，{len(skipped)} 个跳过"
+            self.status(msg)
+        elif skipped:
+            self.status("导入失败：" + "；".join(skipped[:2]), error=True)
+            messagebox.showerror("导入失败", "无法导入：\n" + "\n".join(skipped), parent=self.root)
+        return len(added)
+
+    # ------------------------------------------------------------------
+    # 粘贴导入：一步到位（读剪贴板 → 直接成书），不需要先弹对话框
+    # ------------------------------------------------------------------
+
+    def clipboard_text(self) -> str:
+        """读系统剪贴板文本；没有文本就返回空串（不抛异常）。"""
+        try:
+            return self.root.clipboard_get(type="STRING")
+        except tk.TclError:
+            pass
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    @staticmethod
+    def clipboard_file_paths(text: str) -> List[str]:
+        """剪贴板里是「复制文件」时，把路径还原出来（Explorer 会用 {} 包住带空格的路径）。"""
+        if not text or "\n" not in text.strip() and not os.path.exists(text.strip()):
+            return []
+        paths: List[str] = []
+        for raw in text.replace("{", "\n{").split("\n"):
+            item = raw.strip().strip("{}").strip()
+            if not item:
+                continue
+            if os.path.isfile(item) and item.lower().endswith(
+                    (".txt", ".md", ".markdown", ".text", ".log", ".csv", ".json", ".srt")):
+                paths.append(item)
+            else:
+                return []          # 有一行不是文本文件就当普通文本处理
+        return paths
+
+    def action_paste(self, preview: bool = False) -> None:
+        """粘贴按钮 / Ctrl+V：直接把剪贴板内容变成一本书（最快路径）。
+
+        preview=True（Ctrl+Shift+V 或菜单）才打开可编辑的预览对话框。
+        """
+        text = self.clipboard_text()
+        if not text.strip():
+            self.status("剪贴板里没有文本：先复制一段文字或几个 txt 文件再按 Ctrl+V", error=True)
+            return
+        paths = self.clipboard_file_paths(text)
+        if paths:
+            count = self.import_paths(paths)
+            if count:
+                self.status(f"已从剪贴板导入 {count} 个文件")
+            return
+        if preview:
+            PasteDialog(self, prefill=text)
+            return
+        meta = self.add_book_from_text(textproc.guess_title("", text), text, "剪贴板")
+        if meta:
+            self._paste_undo_id = meta.id
+            self.status(f"已粘贴《{elide(meta.title, 18)}》· {len(text):,} 字 · Ctrl+Z 撤销")
+
+    def action_paste_preview(self) -> None:
+        self.action_paste(preview=True)
+
+    def action_undo_paste(self) -> None:
+        """Ctrl+Z：撤销「上一次粘贴导入」（只对粘贴生效，避免误删手动导入的书）。"""
+        book_id = self._paste_undo_id
+        if not book_id:
+            self.status("没有可撤销的粘贴")
+            return
+        self._paste_undo_id = None
+        self.delete_book(book_id, confirm=False)
+
+    def add_book_from_text(self, title: str, content: str, encoding: str = "剪贴板") -> Optional[BookMeta]:
+        if not content.strip():
+            self.status("内容为空，未导入", error=True)
+            return None
+        meta = self.lib.add(title or textproc.guess_title("", content), content, encoding)
+        self._reload_library(open_id=meta.id)
+        return meta
+
+    def action_delete(self) -> None:
+        index = self._shelf_index()
+        if index is None:
+            self.status("请先在书架中选择一本")
+            return
+        meta = self.store.state["books"][index]
+        self.delete_book(meta.id)
+
+    def delete_book(self, book_id: str, confirm: bool = True) -> bool:
+        book = self.lib.get(book_id)
+        if book is None:
+            return False
+        if confirm and not messagebox.askyesno(
+                "删除文本", f"确定删除《{book.meta.title}》吗？\n该文本及其阅读进度将从本机移除。",
+                parent=self.root):
+            return False
+        self.lib.remove(book_id)
+        was_current = self.store.state["current_id"] == book_id
+        books = self.lib.all_meta()
+        patch = {"books": books, "books_rev": self.store.state["books_rev"] + 1}
+        if was_current:
+            patch.update({"current_id": None, "current": None, "article": None, "chapters": []})
+        self.store.set(patch)
+        self.status(f"已删除《{book.meta.title}》")
+        if was_current and books:
+            self.open_book(books[0].id)   # 自动续读最近一本
+        return True
+
+    def action_rename(self) -> None:
+        index = self._shelf_index()
+        if index is None:
+            self.status("请先在书架中选择一本")
+            return
+        meta = self.store.state["books"][index]
+        new_title = SimplePrompt(self, "重命名", "新的书名：", meta.title).result
+        if new_title and new_title.strip() and new_title.strip() != meta.title:
+            self.lib.rename(meta.id, new_title.strip()[:80])
+            self._reload_library(open_id=self.store.state["current_id"] or meta.id)
+
+    def _shelf_index(self) -> Optional[int]:
+        sel = self.shelf_list.curselection()
+        return int(sel[0]) if sel else None
+
+    def _on_shelf_select(self, _event=None) -> None:
+        index = self._shelf_index()
+        if index is None:
+            return
+        books: List[BookMeta] = self.store.state["books"]
+        if index >= len(books):
+            return
+        meta = books[index]
+        self.store.set({"sidebar": self.store.state["sidebar"]})  # 强制刷新侧栏指纹
+        self._refresh_shelf_info(meta)
+        if meta.id != self.store.state["current_id"]:
+            self.open_book(meta.id)
+
+    def _on_toc_select(self, _event=None) -> None:
+        if self._toc_sync:
+            return
+        sel = self.toc_list.curselection()
+        if not sel or not self._chapter_offsets:
+            return
+        index = int(sel[0])
+        if index < len(self._chapter_offsets):
+            self.goto_chapter(index)
+
+    # ------------------------------------------------------------------
+    # 打开 / 列表
+    # ------------------------------------------------------------------
+
+    def _load_library(self) -> None:
+        books = self.lib.all_meta()
+        self.store.set({"books": books, "books_rev": self.store.state["books_rev"] + 1})
+        self.label_storage.configure(
+            text=f"存储：SQLite（{os.path.basename(self.data_dir)}/library.db）\n"
+                 f"设置：settings.json · 进度按书保存")
+        if books:
+            self.open_book(books[0].id)   # 自动续读最近一本
+        else:
+            self._render_empty()
+            self._render_toc_list(self.store.state)
+
+    def _reload_library(self, open_id: Optional[str] = None) -> None:
+        books = self.lib.all_meta()
+        self.store.set({"books": books, "books_rev": self.store.state["books_rev"] + 1})
+        if open_id:
+            self.open_book(open_id)
+
+    def open_book(self, book_id: str) -> None:
+        book = self.lib.get(book_id)
+        if book is None:
+            self.status("文本已不存在", error=True)
+            return
+        self.save_progress(force=True)          # 切书前先把上一本的进度落盘
+        article = textproc.build_article(book.meta.title, book.content,
+                                         book.meta.size, book.meta.encoding)
+        self.lib.touch(book_id)
+        self.store.set({
+            "current_id": book_id,
+            "current": book,
+            "article": article,
+            "chapters": article.chapters,
+            "books_rev": self.store.state["books_rev"],   # 不触发列表重建
+        })
+        self._refresh_shelf_info(book.meta)
+        self.status(f"《{book.meta.title}》 · {article.chars:,} 字 · "
+                    f"{max(0, len(article.chapters) - 1)} 章")
+
+    # ------------------------------------------------------------------
+    # 设置
+    # ------------------------------------------------------------------
+
+    def set_settings(self, **patch) -> None:
+        s = dict(self.settings)
+        s.update(patch)
+        self._apply_settings(s)
+
+    def _apply_settings(self, settings: Dict) -> None:
+        self.store.set({"settings": settings})
+        self._sync_shelf_visibility()
+        self._apply_immersive()
+        self._schedule_settings_flush()
+
+    def _schedule_settings_flush(self) -> None:
+        if self._settings_job:
+            self.root.after_cancel(self._settings_job)
+        self._settings_job = self.root.after(SETTINGS_DELAY_MS, self._flush_settings)
+
+    def _flush_settings(self) -> None:
+        self._settings_job = None
+        payload = dict(self.settings)
+        payload["sidebar"] = self.store.state["sidebar"]
+        try:
+            payload["window"] = self._logical_geometry()   # 存逻辑尺寸，换 DPI 不跑偏
+        except tk.TclError:
+            pass
+        self.settings_file.save(payload)
+
+    def action_reset_settings(self) -> None:
+        keep = {"shelf_open": self.settings["shelf_open"], "window": self.settings.get("window", "")}
+        reset = dict(DEFAULT_SETTINGS)
+        reset.update(keep)
+        self._apply_settings(reset)
+        self.status("已恢复默认设置")
+
+    def _pick_custom(self, which: str) -> None:
+        s = self.settings
+        current = s["custom_bg"] if which == "bg" else s["custom_fg"]
+        if s["theme"] != "custom":
+            # 从当前预设出发，避免自定义时突然跳到无关颜色
+            base = theme.palette_for(s)
+            current = base.bg if which == "bg" else base.fg
+        _rgb, value = colorchooser.askcolor(color=current, parent=self.root,
+                                            title="选择自定义背景色" if which == "bg" else "选择自定义文字颜色")
+        if not value:
+            return
+        patch = {"theme": "custom"}
+        if s["theme"] != "custom":
+            base = theme.palette_for(s)
+            patch["custom_bg"], patch["custom_fg"] = base.bg, base.fg
+        patch["custom_bg" if which == "bg" else "custom_fg"] = value
+        self.set_settings(**patch)
+
+    def nudge_font(self, delta: int) -> None:
+        lo, hi = FONT_SIZE_RANGE
+        self.set_settings(font_size=max(lo, min(hi, int(self.settings["font_size"]) + delta)))
+
+    def toggle_eye_care(self) -> None:
+        on = not self.settings["eye_care"]
+        self.set_settings(eye_care=on)
+        self.status("护眼模式已开启" if on else "护眼模式已关闭")
+
+    # ------------------------------------------------------------------
+    # 状态栏 / 快捷键 / 关闭
+    # ------------------------------------------------------------------
+
+    def status(self, message: str, error: bool = False) -> None:
+        self.status_label.configure(text=message, fg=self.error_color if error else self.pal.soft)
+        if self._status_job:
+            self.root.after_cancel(self._status_job)
+        if not error:
+            self._status_job = self.root.after(3200, lambda: self.status_label.configure(text="就绪", fg=self.pal.soft))
+
+    def _bind_keys(self) -> None:
+        r = self.root
+        r.bind("<Control-o>", lambda e: self.action_import())
+        r.bind("<Control-O>", lambda e: self.action_import())
+        r.bind("<Control-q>", lambda e: self.on_close())
+        r.bind("<Control-b>", lambda e: self.toggle_shelf())
+        r.bind("<Control-l>", lambda e: self.show_sidebar("toc"))
+        r.bind("<Control-comma>", lambda e: self.show_sidebar("settings"))
+        r.bind("<Control-e>", lambda e: self.toggle_eye_care())
+        # 粘贴：Ctrl+V 一步到位，Ctrl+Shift+V 预览，Ctrl+Z 撤销
+        r.bind("<Control-v>", lambda e: self.action_paste())
+        r.bind("<Control-V>", lambda e: self.action_paste())
+        r.bind("<Control-Shift-V>", lambda e: self.action_paste_preview())
+        r.bind("<Control-Shift-v>", lambda e: self.action_paste_preview())
+        r.bind("<Control-z>", lambda e: self.action_undo_paste())
+        r.bind("<Control-Z>", lambda e: self.action_undo_paste())
+        for seq in ("<Control-equal>", "<Control-plus>", "<Control-KP_Add>"):
+            r.bind(seq, lambda e: self.nudge_font(1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            r.bind(seq, lambda e: self.nudge_font(-1))
+        r.bind("<Alt-Up>", lambda e: self.jump_chapter(-1))
+        r.bind("<Alt-Down>", lambda e: self.jump_chapter(1))
+        r.bind("<F11>", lambda e: self.toggle_immersive())
+        r.bind("<Control-i>", lambda e: self.toggle_immersive())
+        r.bind("<Key>", self._on_plain_key)
+        r.bind("<Escape>", lambda e: self.show_sidebar(None))
+        # 阅读区键盘滚动（Text 处于 disabled 状态也要能翻页）
+        self.reader.bind("<Prior>", lambda e: self._scroll_by(-1, "pages"))
+        self.reader.bind("<Next>", lambda e: self._scroll_by(1, "pages"))
+        self.reader.bind("<space>", lambda e: self._scroll_by(1, "pages"))
+        self.reader.bind("<Up>", lambda e: self._scroll_by(-3, "units"))
+        self.reader.bind("<Down>", lambda e: self._scroll_by(3, "units"))
+        self.reader.bind("<Home>", lambda e: self._moveto(0.0))
+        self.reader.bind("<End>", lambda e: self._moveto(1.0))
+        # Ctrl+滚轮 调字号（阅读器上最符合直觉的手势）
+        for seq in ("<Control-MouseWheel>", "<Control-Button-4>", "<Control-Button-5>"):
+            self.reader.bind(seq, self._on_ctrl_wheel)
+            self.desk.bind(seq, self._on_ctrl_wheel)
+        # 双击正文 = 沉浸模式开关
+        self.reader.bind("<Double-Button-1>", lambda e: self.toggle_immersive())
+        # 右键菜单
+        self.reader.bind("<Button-3>", self._popup_reader_menu)
+        self.desk.bind("<Button-3>", self._popup_reader_menu)
+        self.shelf_list.bind("<Button-3>", self._popup_shelf_menu)
+        # 点击顶部进度线跳转
+        for widget in (self.progress_track, self.progress_fill):
+            widget.bind("<Button-1>", self._on_progress_click)
+            widget.bind("<Motion>", lambda e: self.progress_track.configure(cursor="hand2"))
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _scroll_by(self, amount: int, what: str) -> str:
+        self.reader.yview_scroll(amount, what)
+        self._on_view_changed()
+        return "break"
+
+    def _moveto(self, ratio: float) -> str:
+        self.reader.yview_moveto(ratio)
+        self._on_view_changed()
+        return "break"
+
+    def jump_chapter(self, delta: int) -> None:
+        if not self._chapter_offsets:
+            return
+        current = self.current_chapter_index()
+        target = max(0, min(len(self._chapter_offsets) - 1, current + delta))
+        if target == current and delta:
+            return
+        self.goto_chapter(target)
+
+    def current_chapter_index(self) -> int:
+        """当前视口顶部落在第几个目录项上。"""
+        index = 0
+        for idx, offset in self._chapter_offsets:
+            if offset <= self._char_offset:
+                index = idx
+            else:
+                break
+        return index
+
+    def goto_chapter(self, index: int) -> None:
+        if not self._chapter_offsets or not (0 <= index < len(self._chapter_offsets)):
+            return
+        _idx, offset = self._chapter_offsets[index]
+        self.reader.yview(self._offset_to_index(offset))
+        self._sync_from_view()
+        self._sync_toc_selection()
+        chapters = self.store.state["chapters"]
+        if index < len(chapters):
+            self.status(f"第 {index + 1} / {len(self._chapter_offsets)} 节："
+                        f"{elide(chapters[index].title, 24)}")
+
+    def _on_plain_key(self, event: tk.Event) -> Optional[str]:
+        focus = self.root.focus_get()
+        if isinstance(focus, (tk.Entry, tk.Text)) and focus is not self.reader:
+            return None            # 正在输入框里打字，不劫持
+        char = (event.char or "").lower()
+        if char == "t" or event.keysym.lower() == "t":
+            self.toggle_shelf()
+        elif char == "s":
+            self.show_sidebar("settings")
+        elif char in ("c", "l"):
+            self.show_sidebar("toc")
+        elif char == "e":
+            self.toggle_eye_care()
+        elif char == "j":
+            self.jump_chapter(1)
+        elif char == "k":
+            self.jump_chapter(-1)
+        return None
+
+    def on_close(self) -> None:
+        try:
+            self.save_progress(force=True)
+            self._flush_settings()
+        finally:
+            self.lib.close()
+            self.root.destroy()
+
+    # ------------------------------------------------------------------
+    # 阅读区尺寸变化：重算页宽 + 保持阅读位置
+    # ------------------------------------------------------------------
+
+    def _on_reader_configure(self, _event=None) -> None:
+        if self._pad_job:
+            self.root.after_cancel(self._pad_job)
+        self._pad_job = self.root.after(60, self._reflow)
+
+    def _reflow(self) -> None:
+        self._pad_job = None
+        self._apply_page_layout()
+        if self._char_offset > 0 or self._ratio > 0:
+            # 重新换行后按「字符下标」回到同一处文字（比比例更准）
+            self._restoring = True
+            try:
+                self.reader.yview(self._offset_to_index(self._char_offset)
+                                  if self._char_offset > 0 else "1.0")
+            finally:
+                self.root.after(120, self._end_restore)
+
+    def _on_desk_configure(self, _event=None) -> None:
+        """桌面尺寸变化（窗口缩放 / 侧栏开合）→ 防抖重排。"""
+        if self._desk_job:
+            self.root.after_cancel(self._desk_job)
+        self._desk_job = self.root.after(70, self._on_desk_resize)
+
+    # 兼容旧引用
+    def _on_reader_configure(self, _event=None) -> None:
+        self._on_desk_configure(_event)
+
+    def _on_desk_resize(self) -> None:
+        self._desk_job = None
+        width, height = self._desk_size()
+        changed = (width, height) != self._desk_last_size
+        self._desk_last_size = (width, height)
+        self._apply_page_layout()
+        self._reflow()
+        if changed and self._wallpaper is not None:
+            # 壁纸要按新尺寸重做，但重做比较贵，再延迟一点
+            if self._wallpaper_job:
+                self.root.after_cancel(self._wallpaper_job)
+            self._wallpaper_job = self.root.after(350, self._reload_wallpaper)
+
+    def _reload_wallpaper(self) -> None:
+        self._wallpaper_job = None
+        if self._wallpaper is None:
+            return
+        self._set_wallpaper_from_settings()
+        self._refresh_tints()
+        self._apply_theme(force=True)
+
+    # ------------------------------------------------------------------
+    # 全局壁纸
+    # ------------------------------------------------------------------
+
+    def action_pick_wallpaper(self) -> None:
+        if wallpaper is None:
+            messagebox.showerror("全局壁纸", "壁纸模块不可用（pyreader/wallpaper.py 缺失）",
+                                 parent=self.root)
+            return
+        exts = " ".join("*" + e for e in wallpaper.supported_extensions())
+        path = filedialog.askopenfilename(
+            parent=self.root, title="选择全局壁纸",
+            filetypes=[("图片文件", exts), ("所有文件", "*.*")])
+        if not path:
+            return
+        ok, why = wallpaper.can_open(path)
+        if not ok:
+            messagebox.showerror("无法使用这张图", why, parent=self.root)
+            return
+        self.set_settings(wallpaper_on=True, wallpaper_path=path)
+        self.status(f"壁纸已应用：{os.path.basename(path)}")
+
+    def action_clear_wallpaper(self) -> None:
+        self.set_settings(wallpaper_on=False, wallpaper_path="")
+        self.status("已清除壁纸")
+
+    # ------------------------------------------------------------------
+    # 沉浸模式
+    # ------------------------------------------------------------------
+
+    def toggle_immersive(self) -> None:
+        on = not bool(self.settings.get("immersive"))
+        self.set_settings(immersive=on)
+        self.status("沉浸模式已开启（双击正文 / F11 退出）" if on else "已退出沉浸模式")
+
+    def _apply_immersive(self) -> None:
+        on = bool(self.settings.get("immersive"))
+        if on == getattr(self, "_immersive_state", None):
+            return
+        self._immersive_state = on
+        if on:
+            self.shelf.grid_remove()
+            self.sidebar.grid_remove()
+            self.toolbar.grid_remove()
+        else:
+            self.toolbar.grid()
+            if self.settings.get("shelf_open"):
+                self.shelf.grid()
+            if self.store.state["sidebar"]:
+                self.sidebar.grid()
+        self.root.after(60, self._apply_page_layout)
+
+    # ------------------------------------------------------------------
+    # 鼠标交互
+    # ------------------------------------------------------------------
+
+    def _on_ctrl_wheel(self, event) -> str:
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta == 0:                      # X11 用 Button-4/5
+            delta = 120 if int(getattr(event, "num", 0) or 0) == 4 else -120
+        self.nudge_font(1 if delta > 0 else -1)
+        return "break"
+
+    def _on_progress_click(self, event) -> None:
+        width = max(1, self.progress_track.winfo_width())
+        ratio = max(0.0, min(1.0, event.x / width))
+        self.reader.yview_moveto(ratio)
+        self._sync_from_view()
+        self._sync_toc_selection()
+        self.status(f"跳转到约 {int(ratio * 100)}%")
+
+    def _popup_reader_menu(self, event) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="上一节", command=lambda: self.jump_chapter(-1))
+        menu.add_command(label="下一节", command=lambda: self.jump_chapter(1))
+        menu.add_separator()
+        menu.add_command(label="回到开头", command=lambda: self._moveto(0.0))
+        menu.add_command(label="跳到结尾", command=lambda: self._moveto(1.0))
+        menu.add_separator()
+        menu.add_command(label="放大字号", command=lambda: self.nudge_font(1))
+        menu.add_command(label="缩小字号", command=lambda: self.nudge_font(-1))
+        menu.add_separator()
+        menu.add_command(label="护眼模式", command=self.toggle_eye_care)
+        menu.add_command(label="沉浸模式", command=self.toggle_immersive)
+        menu.add_command(label="更换壁纸…", command=self.action_pick_wallpaper)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _popup_shelf_menu(self, event) -> None:
+        index = self.shelf_list.nearest(event.y)
+        if 0 <= index < self.shelf_list.size():
+            self.shelf_list.selection_clear(0, "end")
+            self.shelf_list.selection_set(index)
+            self._on_shelf_select()
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="打开", command=lambda: self._on_shelf_select())
+        menu.add_command(label="重命名…", command=self.action_rename)
+        menu.add_separator()
+        menu.add_command(label="删除", command=self.action_delete)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ------------------------------------------------------------------
+    # 帮助
+    # ------------------------------------------------------------------
+
+    def action_shortcuts(self) -> None:
+        messagebox.showinfo(
+            "快捷键",
+            "Ctrl+O        导入文件\n"
+            "Ctrl+V        粘贴剪贴板内容（一步成书；剪贴板里是文件则直接导入文件）\n"
+            "Ctrl+Shift+V  粘贴并预览（可改书名、可重新读取剪贴板）\n"
+            "Ctrl+Z        撤销上一次粘贴\n"
+            "Ctrl+B        书架\n"
+            "Ctrl+L        目录\n"
+            "Ctrl+,        阅读设置\n"
+            "Ctrl+E        护眼模式\n"
+            "Ctrl+= / -    放大 / 缩小字号\n"
+            "Alt+↑ / ↓     上一节 / 下一节\n"
+            "PgUp / PgDn   翻页（空格下翻一页）\n"
+            "Home / End    跳到开头 / 结尾\n"
+            "T / S / C / E 书架 / 设置 / 目录 / 护眼（焦点不在输入框时）\n"
+            "Esc           关闭侧栏",
+            parent=self.root)
+
+    def action_about(self) -> None:
+        messagebox.showinfo(
+            "关于",
+            "文本阅读器 · Python 版\n\n"
+            "技术栈：Python 3 + tkinter/ttk（标准库）\n"
+            "存储：SQLite（书库） + JSON（设置），零第三方依赖\n"
+            f"数据目录：{self.data_dir}",
+            parent=self.root)
+
+
+# ==========================================================================
+# 对话框
+# ==========================================================================
+
+
+class SimplePrompt:
+    """单行输入对话框（重命名用）。"""
+
+    def __init__(self, app: "ReaderApp", title: str, label: str, initial: str):
+        S = app.S
+        pal = app.pal
+        parent = app.root
+        self.result: Optional[str] = None
+        self.top = tk.Toplevel(parent)
+        self.top.title(title)
+        self.top.configure(bg=pal.chrome)
+        self.top.transient(parent)
+        self.top.resizable(False, False)
+        frame = tk.Frame(self.top, bg=pal.chrome)
+        frame.pack(fill="both", expand=True, padx=S(16), pady=S(14))
+        tk.Label(frame, text=label, bg=pal.chrome, fg=pal.fg, font=app.font_ui).pack(anchor="w")
+        self.var = tk.StringVar(value=initial)
+        entry = tk.Entry(frame, textvariable=self.var, width=34, bd=1, relief="solid",
+                         bg=pal.bg, fg=pal.fg, insertbackground=pal.fg, highlightthickness=0,
+                         font=app.font_ui)
+        entry.pack(fill="x", pady=(S(6), S(12)))
+        entry.focus_set()
+        entry.select_range(0, "end")
+        row = tk.Frame(frame, bg=pal.chrome)
+        row.pack(fill="x")
+        tk.Button(row, text="取消", command=self._cancel, bd=0, padx=S(12), pady=S(4), cursor="hand2",
+                  font=app.font_ui, bg=pal.chrome, fg=pal.fg,
+                  activebackground=pal.hover).pack(side="right")
+        tk.Button(row, text="确定", command=self._ok, bd=0, padx=S(12), pady=S(4), cursor="hand2",
+                  font=app.font_ui, bg=pal.accent, fg=pal.on_accent, activebackground=pal.accent,
+                  activeforeground=pal.on_accent).pack(side="right", padx=(0, S(8)))
+        entry.bind("<Return>", lambda e: self._ok())
+        self.top.bind("<Escape>", lambda e: self._cancel())
+        self.top.grab_set()
+        parent.wait_window(self.top)
+
+    def _ok(self) -> None:
+        self.result = self.var.get()
+        self.top.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.top.destroy()
+
+
+class PasteDialog:
+    """粘贴预览：打开时已经填好剪贴板内容，改完点「导入」即可。
+
+    日常用法其实不需要它（工具栏「粘贴」/ Ctrl+V 是一步到位），
+    这里给的是「想先看看、改改书名」的路径。
+    """
+
+    def __init__(self, app: ReaderApp, prefill: str = ""):
+        self.app = app
+        S = app.S
+        pal = app.pal
+        self.top = tk.Toplevel(app.root)
+        self.top.title("粘贴预览")
+        self.top.configure(bg=pal.chrome)
+        self.top.transient(app.root)
+        self.top.geometry(f"{S(660)}x{S(560)}")
+        self.top.minsize(S(460), S(360))
+        frame = tk.Frame(self.top, bg=pal.chrome)
+        frame.pack(fill="both", expand=True, padx=S(16), pady=S(14))
+
+        head = tk.Frame(frame, bg=pal.chrome)
+        head.pack(fill="x")
+        tk.Label(head, text="书名", bg=pal.chrome, fg=pal.soft, font=app.font_ui).pack(side="left")
+        self.label_count = tk.Label(head, text="", bg=pal.chrome, fg=pal.soft, font=app.font_ui_small)
+        self.label_count.pack(side="right")
+        self.var_title = tk.StringVar()
+        entry = tk.Entry(frame, textvariable=self.var_title, bd=1, relief="solid", bg=pal.bg, fg=pal.fg,
+                         insertbackground=pal.fg, highlightthickness=0, font=app.font_ui)
+        entry.pack(fill="x", pady=(S(4), S(2)))
+        self.label_hint = tk.Label(frame, text="", bg=pal.chrome, fg=pal.soft, font=app.font_ui_small)
+        self.label_hint.pack(anchor="w", pady=(0, S(8)))
+
+        wrap = tk.Frame(frame, bg=pal.chrome)
+        wrap.pack(fill="both", expand=True, pady=(0, S(10)))
+        self.text = tk.Text(wrap, wrap="word", bd=1, relief="solid", bg=pal.bg, fg=pal.fg,
+                            insertbackground=pal.fg, highlightthickness=0, undo=True,
+                            font=app.font_body)
+        scroll = tk.Scrollbar(wrap, command=self.text.yview, width=S(SCROLLBAR_WIDTH), bd=0,
+                              highlightthickness=0, bg=pal.chrome, troughcolor=pal.chrome,
+                              activebackground=pal.accent)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+
+        row = tk.Frame(frame, bg=pal.chrome)
+        row.pack(fill="x")
+        tk.Button(row, text="重新读取剪贴板", command=self._reload, bd=0, padx=S(10), pady=S(4),
+                  cursor="hand2", font=app.font_ui, bg=pal.chrome, fg=pal.fg,
+                  activebackground=pal.hover).pack(side="left")
+        tk.Button(row, text="取消", command=self.top.destroy, bd=0, padx=S(14), pady=S(4), cursor="hand2",
+                  font=app.font_ui, bg=pal.chrome, fg=pal.fg,
+                  activebackground=pal.hover).pack(side="right")
+        tk.Button(row, text="导入（Ctrl+Enter）", command=self._submit, bd=0, padx=S(14), pady=S(4),
+                  cursor="hand2", font=app.font_ui, bg=pal.accent, fg=pal.on_accent,
+                  activebackground=pal.accent,
+                  activeforeground=pal.on_accent).pack(side="right", padx=(0, S(8)))
+
+        self.text.bind("<<Modified>>", self._on_modified)
+        self.var_title.trace_add("write", lambda *_: self._refresh())
+        self.top.bind("<Escape>", lambda e: self.top.destroy())
+        self.top.bind("<Control-Return>", lambda e: self._submit())
+        self._reload(prefill)
+        self.text.focus_set()
+        self.top.grab_set()
+
+    # -- 内部 ---------------------------------------------------------------
+
+    def _reload(self, prefill: str = "") -> None:
+        content = prefill or self.app.clipboard_text()
+        self.text.delete("1.0", "end")
+        if content:
+            self.text.insert("1.0", content)
+        self.text.edit_reset()
+        self.text.edit_modified(False)
+        self._refresh()
+
+    def _on_modified(self, _event=None) -> None:
+        if self.text.edit_modified():
+            self.text.edit_modified(False)
+            self._refresh()
+
+    def _suggest_title(self) -> str:
+        return textproc.guess_title("", self.text.get("1.0", "end-1c"))
+
+    def _refresh(self) -> None:
+        content = self.text.get("1.0", "end-1c")
+        chars = len(content)
+        lines = content.count("\n") + (1 if content.strip() else 0)
+        self.label_count.configure(text=f"{chars:,} 字 · {lines} 行")
+        typed = self.var_title.get().strip()
+        if typed:
+            self.label_hint.configure(text="书名已手动指定")
+        else:
+            self.label_hint.configure(text=f"留空则自动取首行：{elide(self._suggest_title(), 22)}")
+
+    def _submit(self) -> None:
+        content = self.text.get("1.0", "end-1c")
+        if not content.strip():
+            messagebox.showwarning("粘贴预览", "内容为空：先复制一段文字，或点「重新读取剪贴板」",
+                                   parent=self.top)
+            return
+        title = self.var_title.get().strip() or self._suggest_title()
+        self.top.destroy()
+        meta = self.app.add_book_from_text(title, content)
+        if meta:
+            self.app._paste_undo_id = meta.id
+            self.app.status(f"已粘贴《{elide(meta.title, 18)}》· {len(content):,} 字 · Ctrl+Z 撤销")
+
+
+==============================================================================
+  文件：pyreader/selftest.py
+==============================================================================
+"""自检：python -m pyreader --selftest
+
+分两层：
+  * 核心用例（textproc / theme / storage / state）—— 任何环境都能跑；
+  * GUI 用例（真实创建窗口，驱动 ReaderApp 的公开方法）—— 无显示环境可跳过。
+失败会返回非零退出码，方便接进 CI。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import tkinter as tk
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
+
+RESULTS: List[Tuple[str, bool, str]] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> bool:
+    RESULTS.append((name, bool(ok), detail))
+    return bool(ok)
+
+
+def _core_checks(root_dir: Path) -> None:
+    from . import textproc, theme
+    from .state import Store
+    from .storage import Library, Settings
+
+    # --- 编码探测 -------------------------------------------------------
+    utf8, enc1 = textproc.decode_bytes("中文内容\n第二行".encode("utf-8"))
+    check("编码：UTF-8", utf8.startswith("中文内容") and enc1 == "UTF-8", enc1)
+    bom, enc2 = textproc.decode_bytes(b"\xef\xbb\xbf" + "带BOM".encode("utf-8"))
+    check("编码：UTF-8 BOM", bom == "带BOM" and enc2 == "UTF-8", repr(bom))
+    gbk_bytes = bytes([0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4])
+    gbk, enc3 = textproc.decode_bytes(gbk_bytes)
+    check("编码：GB18030 回退", gbk == "中文测试" and enc3 == "GB18030", f"{gbk}/{enc3}")
+    u16, enc4 = textproc.decode_bytes("Hello, this is a long UTF-16 line without BOM.".encode("utf-16-le"))
+    check("编码：无 BOM 的 UTF-16LE 启发式",
+          u16.startswith("Hello, this is") and enc4 == "UTF-16LE", f"{u16[:14]}/{enc4}")
+
+    # --- 章节识别 -------------------------------------------------------
+    heads = ["第一章 起点", "第一章", "第 2 章：缘起", "Chapter 3 - The Fall", "## 第四章 结局",
+             "序章", "楔子", "番外"]
+    check("章节：常见写法全命中", all(textproc.is_heading(h) for h in heads),
+          ",".join(h for h in heads if not textproc.is_heading(h)) or "all-ok")
+    bodies = ["第一章的内容主要讲述了主人公的成长", "序章内容。", "第二章正文在此，继续验证。",
+              "这是第一章正文，读起来很长的一句话结尾。"]
+    check("章节：正文不误判", not any(textproc.is_heading(b) for b in bodies),
+          ",".join(b for b in bodies if textproc.is_heading(b)) or "none")
+
+    # --- 分段 -----------------------------------------------------------
+    hard = "\n".join(["第一章 起点", "第一段正文。", "第二段正文。"])
+    paras = textproc.split_paragraphs(hard)
+    check("分段：硬折行一行一段", len(paras) == 3, str(paras))
+    spaced = "标题\n\n第一段\n仍然是第一段\n\n第二段\n"
+    paras2 = textproc.split_paragraphs(spaced)
+    check("分段：空行分段并拼接中文软换行", paras2 == ["标题", "第一段仍然是第一段", "第二段"], str(paras2))
+    english = "Title\n\nFirst line\nsecond line\n\nLast paragraph\n"
+    paras3 = textproc.split_paragraphs(english)
+    check("分段：西文软换行补空格", paras3 == ["Title", "First line second line", "Last paragraph"], str(paras3))
+
+    # --- 组装 -----------------------------------------------------------
+    art = textproc.build_article("样章", hard, size=100, encoding="UTF-8")
+    check("组装：块与章节", art.blocks[0].kind == "h1" and len(art.chapters) == 2
+          and art.chapters[1].title == "第一章 起点" and art.paragraphs == 2,
+          f"blocks={len(art.blocks)} chapters={len(art.chapters)}")
+    check("组装：字数与时长", art.chars == len(hard) and art.minutes >= 1, f"{art.chars}/{art.minutes}")
+
+    # --- 主题 -----------------------------------------------------------
+    light = theme.derive_palette("#faf8f5", "#2b2b2b", "#8a6a3b")
+    dark = theme.derive_palette("#1c1f24", "#c9ced7", "#7aa2f7")
+    chrome_ok = (
+        (not light.dark) and dark.dark
+        and theme.luminance(light.chrome) < theme.luminance(light.bg)   # 浅色主题外壳略暗
+        and theme.luminance(dark.chrome) > theme.luminance(dark.bg)     # 深色主题外壳略亮
+    )
+    check("主题：明暗自适应外壳", chrome_ok,
+          f"light {light.bg}->{light.chrome}, dark {dark.bg}->{dark.chrome}")
+    eye = theme.eye_care_palette(light)
+    check("主题：护眼暖色 + 降对比",
+          theme.luminance(eye.bg) <= theme.luminance(light.bg) + 0.02
+          and abs(theme.luminance(eye.fg) - theme.luminance(eye.bg)) <= abs(theme.luminance(light.fg) - theme.luminance(light.bg)),
+          f"bg {light.bg}->{eye.bg} fg {light.fg}->{eye.fg}")
+    check("主题：护眼可与任意主题叠加",
+          theme.effective_palette({"theme": "night", "eye_care": True}).dark is True, "dark")
+    check("主题：自定义配色推导", theme.palette_for({"theme": "custom", "custom_bg": "#22303c", "custom_fg": "#e6e0d4"}).bg == "#22303c", "ok")
+
+    # --- 存储 -----------------------------------------------------------
+    db = root_dir / "core.db"
+    lib = Library(db)
+    meta = lib.add("测试书", "第一章 起点\n正文内容。", "UTF-8")
+    check("存储：新增并可读回", lib.count() == 1 and (lib.get(meta.id) or None) is not None)
+    lib.set_progress(meta.id, 0.4267)
+    got = lib.get(meta.id)
+    check("存储：进度落盘", got is not None and abs(got.meta.progress - 0.4267) < 1e-6
+          and got.meta.percent == 43, str(got.meta.progress if got else None))
+    lib.rename(meta.id, "改名后")
+    check("存储：重命名", (lib.get_meta(meta.id) or meta).title == "改名后")
+    lib.remove(meta.id)
+    check("存储：删除", lib.count() == 0)
+    lib.close()
+
+    settings_file = Settings(root_dir / "settings.json")
+    settings_file.save({"font_size": 27, "theme": "night", "eye_care": True})
+    loaded = settings_file.load()
+    check("设置：落盘并合并默认值",
+          loaded["font_size"] == 27 and loaded["theme"] == "night" and loaded["eye_care"] is True
+          and loaded["page_width"] == 720, f"{loaded['font_size']}/{loaded['theme']}")
+    corrupt = root_dir / "broken.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    check("设置：损坏文件不致命", Settings(corrupt).load()["theme"] == "paper")
+    check("设置：原子写不留临时文件", not list(root_dir.glob("*.tmp")), str(list(root_dir.glob('*.tmp'))))
+
+    # --- 状态容器 -------------------------------------------------------
+    store = Store({"a": 1})
+    seen: List[str] = []
+    store.subscribe(lambda s, p: seen.append(f"{p['a']}->{s['a']}"))
+    store.set({"a": 2})
+    store.set({"a": 2})   # 无变化，不应通知
+    store.set(b=3)
+    check("状态：发布订阅 + 去重通知", seen == ["1->2", "2->2"], str(seen))
+
+
+def _ui_checks(root_dir: Path) -> None:
+    from . import dpi as dpi_mod
+    from . import theme
+    from .app import SHELF_WIDTH, ReaderApp, wallpaper
+    from .storage import Library, Settings
+
+    dpi_mod.enable()   # 与正式启动一致：先声明 DPI 感知，再创建窗口
+
+    sample = root_dir / "ui-sample.txt"
+    doc = ["楔子", "楔子的内容。", "", "第一章 起点", "第一章正文第一段，讲述足够长的故事开端。",
+           "跟随的第二段。", "", "## 第二章 结局", "第二章内容。"]
+    doc += [f"第 {i} 段填充正文，用来撑高页面以验证进度。" for i in range(160)]
+    sample.write_text("\n".join(doc), encoding="utf-8")
+
+    root = tk.Tk()
+    root.geometry("1120x780+40+40")
+    lib = Library(root_dir / "ui.db")
+    try:
+        app = ReaderApp(root, lib, Settings(root_dir / "ui-settings.json"), str(root_dir))
+    except Exception:
+        # 构造失败也要把数据库连接与窗口关掉，否则临时目录清理会再抛一个
+        # PermissionError 把真正的错误盖掉（这就是「自检只看得到文件占用」的原因）
+        lib.close()
+        root.destroy()
+        raise
+    root.update()
+    try:
+        check("GUI：空状态可渲染", "开始你的阅读" in app.reader.get("1.0", "end"), "")
+        check("GUI：高 DPI 缩放已应用",
+              abs(app.scale - max(1.0, app.dpi / 96.0)) < 1e-9
+              and int(app.shelf.cget("width")) == app.S(SHELF_WIDTH)
+              and app.S(100) == max(1, int(round(100 * app.scale))),
+              f"dpi={app.dpi:.0f} scale={app.scale:.2f} 书架宽={app.shelf.cget('width')}px "
+              f"(逻辑 {SHELF_WIDTH}) 页宽={app._page_pad()}px")
+        app.import_paths([str(sample)])
+        root.update()
+        check("GUI：导入后进入书架", len(app.store.state["books"]) == 1
+              and app.store.state["current"] is not None,
+              str([m.title for m in app.store.state["books"]]))
+        check("GUI：书名取文件名", app.store.state["current"].meta.title == "ui-sample", "")
+        check("GUI：章节识别", len(app.store.state["chapters"]) == 4,
+              str([c.title for c in app.store.state["chapters"]]))
+        check("GUI：目录项与章节一致", app.toc_list.size() == len(app.store.state["chapters"]),
+              f"{app.toc_list.size()}")
+        check("GUI：正文有内容与标题 tag",
+              int(app.reader.index("end-1c").split(".")[0]) > 60
+              and len(app.reader.tag_ranges("h2")) >= 2,
+              f"lines={app.reader.index('end-1c')}")
+
+        # 进度保存（语义：ratio = 视口底部已读比例，char_offset = 精确字符位置）
+        # 先滚一次让布局定型（窗口刚映射时会有一次重排），再滚到目标位置测
+        app.reader.yview_moveto(0.6)
+        _settle(root)
+        app.reader.yview_moveto(0.45)
+        _settle(root)
+        top_before = app.reader.index("@0,0")
+        offset_before = app._index_to_offset(top_before)
+        app.save_progress(force=True)
+        stored = lib.get(app.store.state["current_id"])
+        check("GUI：进度落库（比例 + 字符偏移）",
+              stored is not None and 0.2 < stored.meta.progress < 0.95
+              and stored.meta.char_offset == offset_before and offset_before > 0,
+              f"ratio={stored.meta.progress:.3f} off={stored.meta.char_offset}" if stored else "none")
+        check("GUI：进度显示同步",
+              app.label_progress.cget("text").endswith("%")
+              or app.label_progress.cget("text") == "已读完",
+              app.label_progress.cget("text"))
+        check("GUI：书架行显示进度",
+              "%" in app.shelf_list.get(0) or "已读完" in app.shelf_list.get(0),
+              app.shelf_list.get(0))
+
+        # 切书后恢复：恢复的必须是同一行文字（字符偏移精确回位）
+        second = root_dir / "second.txt"
+        second.write_text("另一本书\n\n第一章 别的\n内容内容内容。", encoding="utf-8")
+        app.import_paths([str(second)])
+        _settle(root)
+        app.open_book(stored.meta.id)
+        _settle(root)
+        top_after = app.reader.index("@0,0")
+        check("GUI：重开恢复到同一行文字（不漂移）", top_after == top_before,
+              f"{top_before} -> {top_after}")
+
+        # 目录跳转
+        app.toc_list.selection_clear(0, "end")
+        app.toc_list.selection_set(2)
+        app._on_toc_select()
+        root.update()
+        top2, _ = app.reader.yview()
+        check("GUI：目录跳转生效", top2 > 0.0, f"{top2:.3f}")
+
+        # 排版与主题
+        app.set_settings(font_size=28, theme="night", eye_care=False, line_height=2.2, indent=False)
+        root.update()
+        expected = theme.effective_palette(app.settings).bg
+        check("GUI：字号/主题即时生效",
+              app.font_body.cget("size") == 28 and app.reader.cget("bg") == expected,
+              f"size={app.font_body.cget('size')} bg={app.reader.cget('bg')} want={expected}")
+        check("GUI：首行缩进关闭", int(app.reader.tag_cget("p", "lmargin1")) == 0, "")
+        app.set_settings(eye_care=True)
+        root.update()
+        eye_bg = theme.effective_palette(app.settings).bg
+        check("GUI：护眼模式叠加换色", app.reader.cget("bg") == eye_bg and eye_bg != expected,
+              f"{expected} -> {eye_bg}")
+        app.set_settings(theme="custom", custom_bg="#22303c", custom_fg="#e6e0d4")
+        root.update()
+        check("GUI：自定义配色", app.reader.cget("bg") == theme.effective_palette(app.settings).bg,
+              app.reader.cget("bg"))
+
+        # 侧栏
+        app.show_sidebar("toc")
+        root.update()
+        check("GUI：目录侧栏展开", app.sidebar.winfo_ismapped() and app.toc_panel.winfo_ismapped(), "")
+        app.show_sidebar("settings")
+        root.update()
+        check("GUI：设置侧栏切换", app.settings_panel.winfo_ismapped() and not app.toc_panel.winfo_ismapped(), "")
+        _settle(root, 150)
+        bbox = app.side_canvas.bbox("all")
+        check("GUI：设置侧栏可滚动（壁纸区可达）",
+              bool(bbox) and bbox[3] > app.side_canvas.winfo_height(),
+              f"内容高 {bbox[3] if bbox else 0}px / 视口 {app.side_canvas.winfo_height()}px")
+        app.show_sidebar(None)
+        root.update()
+        check("GUI：侧栏关闭", not app.sidebar.winfo_ismapped(), "")
+
+        # 书架开合
+        app.toggle_shelf()
+        root.update()
+        check("GUI：书架折叠", not app.shelf.winfo_ismapped(), "")
+        app.toggle_shelf()
+        root.update()
+        check("GUI：书架展开", bool(app.shelf.winfo_ismapped()), "")
+
+        # --- 粘贴：一步成书 / 剪贴板是文件 / 撤销 / 空剪贴板 ---
+        root.clipboard_clear()
+        root.clipboard_append("粘贴测试书\n\n第一章 试\n这是从剪贴板直接导入的正文。")
+        root.update()
+        before = len(app.store.state["books"])
+        app.action_paste()
+        _settle(root, 200)
+        pasted = app.store.state["current"]
+        check("GUI：Ctrl+V 一步粘贴成书",
+              len(app.store.state["books"]) == before + 1 and pasted is not None
+              and pasted.meta.title == "粘贴测试书" and pasted.meta.encoding == "剪贴板",
+              f"{pasted.meta.title if pasted else 'none'} / {len(app.store.state['books'])} 本")
+        app.action_undo_paste()
+        _settle(root, 150)
+        check("GUI：Ctrl+Z 撤销粘贴",
+              len(app.store.state["books"]) == before
+              and lib.get(pasted.meta.id) is None,
+              f"{len(app.store.state['books'])} 本")
+
+        clip_file = root_dir / "clip-import.txt"
+        clip_file.write_text("从文件剪贴板导入\n第二行内容。", encoding="utf-8")
+        root.clipboard_clear()
+        root.clipboard_append(str(clip_file))
+        root.update()
+        app.action_paste()
+        _settle(root, 300)
+        check("GUI：剪贴板是文件路径时直接导入文件",
+              any(b.title == "clip-import" for b in app.store.state["books"]),
+              ",".join(b.title for b in app.store.state["books"]))
+
+        root.clipboard_clear()
+        root.update()
+        app.action_paste()          # 空剪贴板：只提示，不能崩
+        check("GUI：空剪贴板有提示不崩溃",
+              "剪贴板" in app.status_label.cget("text"), app.status_label.cget("text"))
+
+        # --- 阅读进度：到底 100% + 重开不漂移 ---
+        app.reader.yview_moveto(1.0)
+        _settle(root)
+        app.save_progress(force=True)
+        stored_end = lib.get(app.store.state["current_id"])
+        check("GUI：读到末尾记 100% 并标记「已读完」",
+              stored_end is not None and stored_end.meta.progress >= 0.999
+              and stored_end.meta.finished
+              and app.label_progress.cget("text") == "已读完",
+              f"{stored_end.meta.progress:.3f} / {app.label_progress.cget('text')}"
+              if stored_end else "none")
+        end_offset = stored_end.meta.char_offset if stored_end else -1
+        app.open_book(app.store.state["current_id"])
+        _settle(root)
+        again = lib.get(app.store.state["current_id"])
+        check("GUI：重开不漂移（字符偏移一致）",
+              again is not None and again.meta.char_offset == end_offset,
+              f"{end_offset} -> {again.meta.char_offset if again else 'none'}")
+
+        # --- 桌面 / 纸页布局 ---
+        rect = app._page_rect
+        page_w = rect[2] - rect[0]
+        check("GUI：纸页居中且不超过页宽设置",
+              page_w <= app.S(int(app.settings["page_width"])) + 1
+              and abs((app.desk.winfo_width() - page_w) / 2 - rect[0]) <= 2
+              and app.reader.winfo_width() == page_w,
+              f"纸页 {page_w}px / 桌面 {app.desk.winfo_width()}px @ x={rect[0]}")
+
+        # --- 质感与壁纸 ---
+        check("GUI：桌面纸纹已生成", app._texture_photo is not None, "")
+        if wallpaper is not None:
+            wp_png = root_dir / "wall.png"
+            width = height = 32
+            pixels = bytearray()
+            for y in range(height):
+                for x in range(width):
+                    pixels += bytes((x * 8 % 256, y * 8 % 256, 160, 255))
+            wp_png.write_bytes(wallpaper.png_bytes(width, height, bytes(pixels)))
+            app.set_settings(wallpaper_on=True, wallpaper_path=str(wp_png), wallpaper_mode="cover")
+            _settle(root)
+            check("GUI：壁纸加载并铺到桌面",
+                  app._wallpaper is not None and len(app.desk.find_all()) > 0,
+                  f"backend={wallpaper.backend()} 图层={len(app.desk.find_all())}")
+            app.set_settings(wallpaper_on=False, wallpaper_path="")
+            _settle(root)
+            check("GUI：清除壁纸", app._wallpaper is None, "")
+        else:
+            check("GUI：壁纸模块缺失时自动降级", app._wallpaper is None, "wallpaper.py 不存在")
+
+        # --- 沉浸模式 ---
+        app.toggle_immersive()
+        _settle(root)
+        check("GUI：沉浸模式隐藏书架与工具栏",
+              not app.shelf.winfo_ismapped() and not app.toolbar.winfo_ismapped()
+              and bool(app.desk.winfo_ismapped()),
+              "")
+        app.toggle_immersive()
+        _settle(root)
+        check("GUI：退出沉浸模式恢复",
+              bool(app.toolbar.winfo_ismapped()) and bool(app.shelf.winfo_ismapped()), "")
+
+        # --- 点击进度线跳转 ---
+        app.open_book(stored.meta.id)          # 用长文验证：短文整屏可见，没有跳转概念
+        _settle(root)
+        app.reader.yview_moveto(0.8)
+        _settle(root)
+
+        class _Click:
+            x = 6
+        app._on_progress_click(_Click())
+        _settle(root)
+        check("GUI：点击顶部进度线跳转", app.reader.yview()[0] < 0.2,
+              f"yview={app.reader.yview()[0]:.3f}")
+
+        # 删除
+        before = len(app.store.state["books"])
+        current_id = app.store.state["current_id"]
+        app.delete_book(current_id, confirm=False)
+        root.update()
+        check("GUI：删除当前书并续读下一本",
+              len(app.store.state["books"]) == before - 1 and app.store.state["current_id"] != current_id,
+              f"{before}->{len(app.store.state['books'])}")
+        while app.store.state["books"]:
+            app.delete_book(app.store.state["books"][0].id, confirm=False)
+            root.update()
+        check("GUI：删空后回到空状态",
+              app.store.state["current"] is None and "开始你的阅读" in app.reader.get("1.0", "end"),
+              "")
+        check("GUI：无异常栈（见 stderr）", True, "")
+    finally:
+        lib.close()
+        root.destroy()
+
+
+def _settle(root, ms: int = 260) -> None:
+    """让真实时间流逝：位置恢复锁 / 防抖 / after 回调都需要它。"""
+    import time as _time
+
+    end = _time.time() + ms / 1000.0
+    while _time.time() < end:
+        root.update()
+        _time.sleep(0.01)
+
+
+def run(data_dir: Optional[Path] = None, ui: bool = True) -> int:
+    RESULTS.clear()
+    tmp = None
+    if data_dir is None:
+        tmp = tempfile.TemporaryDirectory(prefix="pyreader-selftest-")
+        root_dir = Path(tmp.name)
+    else:
+        root_dir = Path(data_dir)
+        root_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"数据目录：{root_dir}")
+    print("-" * 72)
+    _core_checks(root_dir)
+
+    if ui:
+        try:
+            _ui_checks(root_dir)
+        except tk.TclError as exc:
+            check("GUI：无可用显示，跳过", True, f"skipped ({exc})")
+        except Exception as exc:  # noqa: BLE001 - 自检要把异常变成一条失败用例
+            check("GUI：运行期异常", False, f"{type(exc).__name__}: {exc}")
+
+    failed = [r for r in RESULTS if not r[1]]
+    for name, ok, detail in RESULTS:
+        mark = "PASS" if ok else "FAIL"
+        print(f"[{mark}] {name}" + (f"  — {detail}" if detail else ""))
+    print("-" * 72)
+    print(f"共 {len(RESULTS)} 项，通过 {len(RESULTS) - len(failed)} 项，失败 {len(failed)} 项")
+
+    if ui and any(name.startswith("GUI") for name, _ok, _d in RESULTS):
+        print("（GUI 用例会短暂显示窗口，属正常现象）")
+    if tmp is not None:
+        tmp.cleanup()
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(run(Path(sys.argv[1]) if len(sys.argv) > 1 else None))
+
+
+==============================================================================
+  文件：run.py
+==============================================================================
+#!/usr/bin/env python
+"""文本阅读器启动器：在任意目录下都能正确运行（解决 "No module named pyreader"）。
+
+用法：
+    python run.py                      # 启动阅读器
+    python run.py sample/晨间随笔.txt   # 启动并导入指定文件
+    python run.py --selftest           # 自检（会短暂弹出窗口）
+    python run.py --selftest --no-ui-selftest   # 只跑核心用例
+    python run.py --data-dir ./data    # 指定数据目录
+
+Windows 用户可直接双击同目录的「启动阅读器.bat」，无需命令行。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import traceback
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))          # 关键：把自己所在目录放进模块搜索路径
+
+LOG = HERE / "pyreader-error.log"
+
+
+def _report(title: str, detail: str) -> int:
+    """把失败原因同时写到日志、日志窗口和弹出的错误框里，避免「一闪而过」。"""
+    try:
+        LOG.write_text(detail, encoding="utf-8")
+    except OSError:
+        pass
+    sys.stderr.write(detail.rstrip() + "\n")
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, detail.strip()[:1200] + f"\n\n详细日志：\n{LOG}")
+        root.destroy()
+    except Exception:
+        pass
+    try:
+        if os.name == "nt" and LOG.exists():
+            os.startfile(LOG)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return 1
+
+
+def main() -> int:
+    try:
+        import tkinter  # noqa: F401  仅用于提前判断 GUI 是否可用
+    except Exception as exc:  # pragma: no cover
+        return _report(
+            "缺少 tkinter",
+            f"当前 Python 没有可用的 tkinter，无法显示窗口。\n\n{type(exc).__name__}: {exc}\n\n"
+            "Windows 解决办法：重新运行 python.org 的安装包 → Modify → 勾选 "
+            "「tcl/tk and IDLE」→ 安装完成后重试。",
+        )
+    # 关键：在创建任何窗口之前声明 DPI 感知，否则 150% 缩放屏上字体是被系统
+    # 拉伸的位图，看起来发糊。本文件与 pyreader 包放同一目录即可运行，路径无关。
+    if not any(a == "--dpi" or a.startswith("--dpi=") for a in sys.argv[1:]):
+        try:
+            from pyreader import dpi as dpi_mod
+
+            dpi_mod.enable()
+        except Exception:
+            pass
+    try:
+        from pyreader.__main__ import main as app_main
+
+        return app_main(sys.argv[1:])
+    except SystemExit as exc:  # argparse 的正常退出
+        return int(exc.code or 0)
+    except Exception:
+        return _report("文本阅读器启动失败", "".join(traceback.format_exception(*sys.exc_info())))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+==============================================================================
+  文件：pyreader_exe.py
+==============================================================================
+"""PyInstaller 打包入口（模块相对导入在脚本模式下不可用，所以用这个薄壳）。
+
+用法：
+    TextReader.exe                # 启动阅读器
+    TextReader.exe --selftest     # 自检（GUI 版无控制台，看不到输出，请用 SelfTest.exe）
+
+打包好的 GUI 版没有控制台：一旦启动过程抛异常，用户看到的就是「双击没反应」。
+所以这里统一兜住异常 —— 写日志 + 弹错误框，绝不让失败静默。
+"""
+
+from __future__ import annotations
+
+import sys
+import traceback
+from pathlib import Path
+
+
+def _base_dir() -> Path:
+    """exe 所在目录（打包后）；源码运行时是脚本所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _report_crash(detail: str) -> int:
+    log = _base_dir() / "启动失败-日志.txt"
+    try:
+        log.write_text(detail, encoding="utf-8")
+    except OSError:
+        log = None  # type: ignore[assignment]
+    sys.stderr.write(detail)
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "文本阅读器启动失败",
+            detail.strip()[-1200:] + (f"\n\n完整日志：\n{log}" if log else ""),
+        )
+        root.destroy()
+    except Exception:
+        pass
+    try:
+        if log is not None and sys.platform == "win32":
+            import os
+
+            os.startfile(log)                 # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return 1
+
+
+if __name__ == "__main__":
+    here = _base_dir()
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    try:
+        from pyreader import dpi as dpi_mod
+
+        dpi_mod.enable()          # 必须在创建任何窗口之前
+        from pyreader.__main__ import main
+
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:         # noqa: BLE001 - 兜住一切，转成可见的错误
+        sys.exit(_report_crash("".join(traceback.format_exception(*sys.exc_info()))))
+
+
+==============================================================================
+  文件：启动阅读器.bat
+==============================================================================
+@echo off
+rem ---------------------------------------------------------------
+rem  Text Reader launcher. ASCII only on purpose: cmd.exe parses
+rem  .bat files with the OEM code page, so non-ASCII text here would
+rem  show up as garbage. All Chinese messages live in run.py.
+rem ---------------------------------------------------------------
+setlocal
+cd /d "%~dp0"
+rem Force a UTF-8 console so any Python message shows correctly.
+chcp 65001 >nul 2>nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+
+set "PYEXE="
+where py >nul 2>nul && set "PYEXE=py -3"
+if not defined PYEXE (
+  where python >nul 2>nul && set "PYEXE=python"
+)
+if not defined PYEXE (
+  echo.
+  echo [ERROR] Python not found on PATH.
+  echo Install Python 3.8+ from https://www.python.org/downloads/
+  echo and make sure "Add python.exe to PATH" is checked.
+  echo.
+  pause
+  exit /b 1
+)
+
+rem Prefer pythonw.exe so no console window stays open behind the reader.
+set "PYW="
+for /f "delims=" %%i in ('%PYEXE% -c "import os,sys;print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))" 2^>nul') do set "PYW=%%i"
+
+if exist "%PYW%" (
+  start "" "%PYW%" "%~dp0run.py" %*
+  exit /b 0
+)
+
+rem Fallback: run with a console so any traceback stays visible.
+%PYEXE% "%~dp0run.py" %*
+if errorlevel 1 pause
+endlocal
+
+
+==============================================================================
+  文件：运行自检.bat
+==============================================================================
+@echo off
+rem  Self-test launcher (keeps the console open so you can read the result).
+setlocal
+cd /d "%~dp0"
+rem Force a UTF-8 console so the Chinese self-test output renders correctly.
+chcp 65001 >nul 2>nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+
+set "PYEXE="
+where py >nul 2>nul && set "PYEXE=py -3"
+if not defined PYEXE (
+  where python >nul 2>nul && set "PYEXE=python"
+)
+if not defined PYEXE (
+  echo.
+  echo [ERROR] Python not found on PATH. Install Python 3.8+ first.
+  echo.
+  pause
+  exit /b 1
+)
+
+%PYEXE% "%~dp0run.py" --selftest %*
+echo.
+echo ---------------------------------------------------------------
+echo Exit code: %ERRORLEVEL%
+pause
+endlocal
+
+

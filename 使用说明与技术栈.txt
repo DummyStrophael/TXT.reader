@@ -1,0 +1,102 @@
+﻿文本阅读器 · 使用说明与技术栈
+================================================================
+一、这个文件夹里是什么
+  这是「文本阅读器」的完整源码，以 .txt 形式保存（方便直接看、搜索、打印）。
+    · 源码-全部.txt        所有文件按顺序合并成一份，带文件索引
+    · app.py.txt 等        按文件拆分的单份源码（文件名后缀加 .txt）
+    · 使用说明与技术栈.txt  本文件
+
+二、两种使用方式
+  A. 直接用打包好的程序（推荐）
+     桌面 →「文本阅读器」文件夹 → 双击「文本阅读器.exe」。
+     该 exe 自带 Python 运行时与 tkinter，机器上不装 Python 也能跑。
+  B. 用源码运行（需要本机有 Python 3.8+）
+     1) 把 .txt 的源码还原成 .py：
+          · 用记事本打开 app.py.txt，另存为 app.py（编码选 UTF-8）；
+          · 目录结构要和源码里的路径一致：
+              项目根/
+                run.py, pyreader_exe.py
+                pyreader/  __init__.py __main__.py dpi.py textproc.py
+                           theme.py storage.py state.py wallpaper.py
+                           app.py selftest.py
+     2) 运行：  python run.py             （启动阅读器）
+                python run.py --selftest  （自检，61 项）
+     3) 也可以直接  cd 项目目录 && python -m pyreader
+     注意：run.py 会把自身目录加入模块搜索路径，所以在任何目录下执行都不会
+           报 "No module named pyreader"；但 pyreader 包必须和 run.py 同级。
+
+三、需求覆盖（文本阅读器）
+  · 打开/导入文本：文件选择（Ctrl+O，支持多选）、粘贴导入（Ctrl+V 一步成书）、
+    剪贴板里是文件时直接导入文件
+  · 书架增删与选择：左侧书架列，显示每本进度与书脊色，支持重命名（双击）、
+    删除（右键或按钮，带确认）、右键菜单
+  · 字号调节：设置面板滑块 + A−/A+ + Ctrl+滚轮 / Ctrl+= / Ctrl+-，12~34pt
+  · 背景色调整：6 套预设（纸白/米黄/护眼绿/淡灰/夜间/纯黑）+ 自定义背景/文字色
+  · 护眼模式：暖色降蓝光 + 降低对比度，可与任意配色叠加
+  · 阅读进度保存：按「字符位置」精确记忆，改字号/改窗口都不跑偏，读到末尾记 100%
+  附加：目录（章节识别）、全局壁纸、桌面纸纹、沉浸模式、高 DPI 清晰渲染
+
+四、技术栈
+  语言        Python 3.8+（开发与打包实测 Python 3.12）
+  GUI         tkinter / Tk 8.6（标准库）+ 纯 tk 控件
+              选它的原因：标准库自带、零安装；而且纯 tk 控件能完整改背景色，
+              ttk 在 Windows 上走原生主题，背景色/护眼这类需求改不动
+  正文渲染    tk.Text + tag（font / spacing1-3 / lmargin1 / justify）
+              在一个控件里实现标题层级、行距、段距、首行缩进、居中空状态
+  桌面与壁纸  tk.Canvas（画布图元）+ 自写 PNG 编码器（zlib + crc32）生成半透明
+              纸纹与压暗层；有 Pillow 时用 LANCZOS 缩放，没有则退化为 Tk 内置解码
+  存储        sqlite3（书库，WAL 模式）+ json（设置，临时文件 + os.replace 原子写）
+  状态管理    自写 40 行发布-订阅容器（Store），视图用「渲染指纹」判重
+  高 DPI      ctypes 调 Win32 SetProcessDpiAwarenessContext（PerMonitorV2），
+              界面像素常量统一乘 dpi/96，字体原生渲染不糊
+  打包        PyInstaller 6.22（--onefile；GUI 版 --noconsole，自检版 --console）
+  第三方依赖  运行期零依赖（Pillow 可选，仅用于 JPG/WebP 壁纸与更好的缩放）
+  代码规模    14 个文件、约 4575 行
+
+五、模块分工（分层，纯逻辑与界面彻底分开）
+  pyreader/textproc.py   编码探测 / 分段 / 章节识别 / 阅读统计（无 UI，可单测）
+  pyreader/theme.py      配色令牌推导 + 护眼调色板变换 + HSV 工具
+  pyreader/storage.py    SQLite 书库（含 char_offset 迁移）+ JSON 设置
+  pyreader/state.py      发布-订阅状态容器
+  pyreader/wallpaper.py  壁纸加载/缩放/取色 + 纯 Python PNG 编码 + 纸纹/暗角
+  pyreader/dpi.py        高 DPI 感知声明与自助诊断
+  pyreader/app.py        tkinter 主窗口：布局 / 渲染 / 交互 / 对话框
+  pyreader/selftest.py   自检（核心 23 项 + GUI 38 项）
+  run.py                 命令行启动器（任意目录可运行）
+  pyreader_exe.py        PyInstaller 打包入口
+  启动阅读器.bat / 运行自检.bat  Windows 双击入口
+
+六、数据存在哪（便携模式）
+  默认全部放在「程序目录\data\」（源码运行时就是「项目根\data\」）：
+      data\library.db      书库正文 + 每本进度（SQLite，WAL）
+      data\settings.json   界面与排版设置
+  优先级：--data-dir  >  环境变量 PYREADER_HOME  >  程序目录\data  >  用户目录
+  程序目录不可写（Program Files / 只读盘 / 无权限共享盘）时自动回退到
+  %APPDATA%\PyTextReader\。菜单「文件 → 打开数据文件夹」可直接打开。
+  从旧版升级：第一次运行会把 %APPDATA%\PyTextReader\ 的 library.db 与
+  settings.json 复制到新位置（复制而非移动，老目录保留）。
+  卸载：删程序文件夹即可，不写注册表。
+七、自检
+  双击「运行自检.bat」= 自检工具.exe --selftest，共 61 项：
+    核心 23 项：四种编码、章节识别正反例、两种分段模式、主题推导、护眼叠加、
+               书库增删改查、设置原子写与损坏容错、状态容器去重通知
+    GUI  38 项：高 DPI 缩放、空状态、导入、章节与目录一致、进度落库与「已读完」、
+               重开不漂移、纸页布局、纸纹、壁纸加载/清除、沉浸模式、点击进度线跳转、
+               粘贴一步成书 / 剪贴板文件 / 撤销 / 空剪贴板、侧栏可滚动、删除与空状态
+  退出码 0 = 全部通过。自检使用临时目录，不会动你的书架。
+
+八、自己重新打包成 exe
+  pip install pyinstaller
+  pyinstaller --noconfirm --clean --onefile --noconsole --name 文本阅读器 pyreader_exe.py
+  pyinstaller --noconfirm --clean --onefile --console  --name 自检工具   pyreader_exe.py
+
+九、已知限制与取舍
+  · tkinter 控件没有真正的透明通道：壁纸在纸页四周与（融入后的）面板底色中体现，
+    纸页保持不透明以保证文字可读（做成了「桌上一张纸」的观感）。
+  · 不支持把文件拖进窗口（tkinter 无内置拖放，需要第三方 tkinterdnd2）。
+  · 一屏渲染整本书的 Text 内容，几十万字以上首次构建会略慢。
+  · 进度按滚动位置记比例 + 字符偏移，不做真实分页。
+  · 多显示器且缩放不同时，Tk 8.6 不处理跨屏 DPI 变化，拖到另一块屏需重开程序。
+  · exe 未做数字签名，首次运行 Windows SmartScreen 会提示，选「仍要运行」即可。
+================================================================
+
